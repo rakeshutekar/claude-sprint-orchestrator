@@ -129,24 +129,24 @@ echo ".claude/worktrees/" >> .gitignore && git add .gitignore && git commit -m "
                     ┌───────────┼───────────┐
                     ▼           ▼           ▼        (one pair per ticket)
 ┌──────────────────────────────────────────────────────────────────┐
-│              PHASE 2: DEPLOY AGENT PAIRS (PARALLEL)              │
+│           PHASE 2: DEPLOY AGENT TEAMS (PARALLEL)                 │
 │                                                                  │
 │  ┌──────────────────────────────────────────────────────────┐    │
-│  │  PER TICKET — ISOLATED WORKTREE                          │    │
+│  │  PER TICKET — SHARED WORKTREE (Agent Team)               │    │
 │  │                                                          │    │
-│  │  ┌─────────────────┐     context      ┌──────────────┐  │    │
-│  │  │  CONTEXT AGENT   │───────────────▶│  WORKER AGENT │  │    │
-│  │  │  (Sonnet 4.6)   │    output        │  (Opus 4.6)  │  │    │
-│  │  │                 │                  │              │  │    │
-│  │  │  • Read codebase │                  │  • Implement │  │    │
-│  │  │  • Map patterns  │                  │  • Write tests│  │    │
-│  │  │  • Find deps     │                  │  • Lint/type  │  │    │
-│  │  │  • Summarize     │                  │  • Commit     │  │    │
-│  │  └─────────────────┘                  └──────┬───────┘  │    │
-│  │                                              │          │    │
-│  └──────────────────────────────────────────────┼──────────┘    │
-│                                                 │               │
-└─────────────────────────────────────────────────┼───────────────┘
+│  │  ┌─────────────────┐  ◄── messages ──►  ┌────────────┐  │    │
+│  │  │  CONTEXT AGENT   │   (real-time)      │  WORKER    │  │    │
+│  │  │  (Sonnet 4.6)   │   direct comms      │  (Opus 4.6)│  │    │
+│  │  │                 │                     │            │  │    │
+│  │  │  • Read codebase │  W: "signature?"   │  • Implement│  │    │
+│  │  │  • Map patterns  │  C: "fn(x:T):R"   │  • Write tests│ │    │
+│  │  │  • Answer Qs     │  W: "test mock?"   │  • Lint/type│  │    │
+│  │  │  • Stay alive    │  C: "vi.mock(...)" │  • Commit   │  │    │
+│  │  └─────────────────┘                     └──────┬─────┘  │    │
+│  │   (read-only, no commits)                       │        │    │
+│  └─────────────────────────────────────────────────┼────────┘    │
+│                                                    │             │
+└────────────────────────────────────────────────────┼─────────────┘
                                                   │
                                                   ▼
 ┌─────────────────────────────────────────────────────────────────────┐
@@ -485,47 +485,48 @@ Before deploying agents, ask the user which coordination mode to use:
 
 How should agents coordinate during this sprint?
 
-### Option 1: Subagents (Recommended for most sprints)
-  Each agent runs independently in its own worktree and reports results
-  back to the orchestrator. Agents CANNOT talk to each other — the
-  orchestrator passes all context between them.
+### Option 1: Agent Teams (Recommended)
+  Per ticket, the orchestrator acts as team lead and spawns a Context Agent
+  (Sonnet) and Worker Agent (Opus) as teammates in the SAME worktree.
+  Both agents are alive simultaneously and can MESSAGE each other directly.
 
   Best for:
-  ✓ Independent tickets with few cross-ticket dependencies
-  ✓ Lower token cost (~$2-5 per ticket)
-  ✓ Predictable, sequential verification flow
-  ✓ Works with any Claude Code version
-
-  How it works:
-  • Context Agent reads codebase → passes output to Worker Agent
-  • Worker implements in isolation → orchestrator routes to Verification
-  • Agents never see each other's work until merge phase
-
-### Option 2: Agent Teams (Experimental — for tightly coupled tickets)
-  Agents run as a coordinated team. They can MESSAGE each other directly,
-  share a task list, and claim work autonomously. The orchestrator acts
-  as a team lead, not a message bus.
-
-  Best for:
-  ✓ Tightly coupled tickets (shared services, cross-feature integration)
-  ✓ Complex merge scenarios where agents need to negotiate file boundaries
-  ✓ Debugging sprints where competing hypotheses benefit from agent debate
+  ✓ All ticket types, especially mid-implementation discoveries
+  ✓ Worker can ask Context Agent follow-up questions in real-time
+  ✓ No lossy context transfer, Context Agent stays alive with full codebase knowledge
+  ✓ Reduces verification loops (Worker gets better information upfront)
   ✓ Requires Claude Code with CLAUDE_CODE_EXPERIMENTAL_AGENT_TEAMS=1
 
   How it works:
-  • Team lead (orchestrator) spawns teammates with task assignments
-  • Teammates claim tasks, work in parallel, and message each other
-  • When one agent discovers a pattern, it broadcasts to all teammates
-  • Higher token cost but better coordination for complex work
+  • Orchestrator (team lead) spawns Context Agent + Worker Agent per ticket
+  • Context Agent researches codebase, Worker implements
+  • Worker can ASK Context Agent for signatures, patterns, test conventions
+  • Context Agent can WARN Worker about patterns it discovers mid-research
+  • Both operate in the same worktree, only Worker commits
+  • Higher token cost (Context Agent stays alive) but fewer retry loops
 
-  ⚠️  Agent Teams are experimental and require Opus 4.6.
-      Requires: CLAUDE_CODE_EXPERIMENTAL_AGENT_TEAMS=1 in settings.json
+### Option 2: Subagents (Fallback, lower cost)
+  Each agent runs independently in its own worktree and reports results
+  back to the orchestrator. Agents CANNOT talk to each other, the
+  orchestrator passes all context between them as a one-way handoff.
 
-Which mode? (1 = Subagents / 2 = Agent Teams)
+  Best for:
+  ✓ Simple, independent tickets with clear requirements
+  ✓ Lower token cost (~$2-5 per ticket)
+  ✓ Predictable, sequential flow
+  ✓ Works with any Claude Code version (no experimental flag needed)
+
+  How it works:
+  • Context Agent reads codebase → returns text summary → dies
+  • Orchestrator pastes summary into Worker Agent prompt
+  • Worker implements in isolation, cannot ask follow-up questions
+  • One-way context transfer, lossy by nature
+
+Which mode? (1 = Agent Teams / 2 = Subagents)
 ```
 
-Store the choice as `COORDINATION_MODE` ("subagents" or "agent-teams").
-This affects how Phase 2, Phase 3, and Phase 6 deploy their agents.
+Store the choice as `COORDINATION_MODE` ("agent-teams" or "subagents").
+This affects how Phase 2 deploys its agents.
 
 If user selects Agent Teams, verify the experimental flag is set:
 ```bash
@@ -605,59 +606,91 @@ If zero tickets found → STOP. Sprint is already complete.
 
 ---
 
-## PHASE 2: DEPLOY AGENT PAIRS (ALL TICKETS IN PARALLEL)
+## PHASE 2: DEPLOY AGENT TEAMS (ALL TICKETS IN PARALLEL)
 
-For each ticket, spawn **two agents sequentially** (context first, then worker), but run all ticket pairs **in parallel** across tickets.
+For each ticket, deploy an **Agent Team** where the orchestrator is team lead and spawns
+a Context Agent (Sonnet) + Worker Agent (Opus) as teammates in the same worktree. Both
+agents are alive simultaneously and can message each other directly. All ticket teams
+run **in parallel** across tickets.
 
-### How Agent Pairing Works with Worktrees
+If `COORDINATION_MODE == "subagents"`, fall back to the sequential mode: Context Agent
+runs first, returns text, dies, then Worker Agent is spawned with that text pasted into
+its prompt. See "Subagent Fallback" section below.
+
+### How Agent Teams Work Per Ticket (Default)
 
 ```
-ORCHESTRATOR (you — lightweight, minimal context)
+ORCHESTRATOR (you — team lead, minimal context)
 │
-├── Ticket CLA-15 ─────────────────────────────────────────────
+├── Ticket CLA-15 ─── AGENT TEAM (one worktree) ──────────────
 │   │
-│   ├── [1] Context Agent (Sonnet, isolation: "worktree")
-│   │       → Reads codebase in clean worktree
-│   │       → Returns structured context + agent_id
-│   │       → Worktree auto-cleaned (no changes made)
+│   │  ┌─────────────────────────────────────────────────┐
+│   │  │  SHARED WORKTREE (isolation: "worktree")        │
+│   │  │                                                 │
+│   │  │  Context Agent (Sonnet) ◄────► Worker Agent (Opus) │
+│   │  │  • Reads codebase            • Implements         │
+│   │  │  • Maps patterns             • Writes tests       │
+│   │  │  • Stays alive for           • Asks follow-up     │
+│   │  │    follow-up questions         questions          │
+│   │  │  • READ-ONLY (no commits)    • COMMITS changes   │
+│   │  │                                                 │
+│   │  │  Direct messaging:                              │
+│   │  │  Worker → "What's the signature of X?"          │
+│   │  │  Context → "src/services/x.ts:34 exports X(...)"│
+│   │  │  Worker → "How do similar tests mock Y?"        │
+│   │  │  Context → "tests/y.test.ts uses vi.mock(...)   │
+│   │  │             with factory pattern at line 12"    │
+│   │  └─────────────────────────────────────────────────┘
 │   │
-│   └── [2] Worker Agent (Opus, isolation: "worktree")
-│           → Receives context agent output in its prompt
-│           → Implements in its own worktree
-│           → Commits → worktree PRESERVED
-│           → Returns: worktree path, branch name, agent_id
+│   └── Returns: worktree path, branch name, WORKER_RESULT, agent_ids
 │
-├── Ticket CLA-16 ─────────────────── (runs in PARALLEL with above)
-│   ├── [1] Context Agent ...
-│   └── [2] Worker Agent ...
+├── Ticket CLA-16 ─── AGENT TEAM ──── (runs in PARALLEL with above)
+│   └── [Context Agent ◄──► Worker Agent] in shared worktree
 │
 └── ... (all tickets simultaneously)
 ```
 
-**CRITICAL: The orchestrator STORES each agent's returned output and agent_id.**
-These are needed for: fix agents (resume), review agents (branch name), conflict agents (context).
+**CRITICAL: The orchestrator STORES each team's returned output and agent_ids.**
+These are needed for: fix agents (resume worker), review agents (branch name), conflict agents (context).
 
-### Step 2A: Context Agent (per ticket)
+### Subagent Fallback (COORDINATION_MODE == "subagents")
+
+If subagents mode is selected, Phase 2 reverts to sequential handoff:
+1. Context Agent (Sonnet) runs in a worktree, reads codebase, returns text, worktree auto-cleaned
+2. Orchestrator pastes Context Agent output into Worker Agent prompt
+3. Worker Agent (Opus) runs in a NEW worktree, implements, commits, worktree preserved
+The Worker cannot ask follow-up questions. Context transfer is one-way and lossy.
+
+### Step 2A: Deploy Agent Team (per ticket)
+
+**Agent Teams Mode (default):**
+
+The orchestrator (team lead) spawns both agents as teammates in a single worktree.
+Both agents are alive simultaneously and can message each other.
 
 ```yaml
-# Task tool parameters:
-subagent_type: "Explore"
-model: "sonnet"
-isolation: "worktree"     # Gets a clean, isolated view of the codebase
-                          # Auto-cleaned after (read-only — no changes)
+# The orchestrator creates an Agent Team per ticket:
+# 1. Create worktree for this ticket
+# 2. Spawn Context Agent (Sonnet) as teammate — role: researcher
+# 3. Spawn Worker Agent (Opus) as teammate — role: implementer
+# 4. Both operate in the SAME worktree
+# 5. Context Agent is READ-ONLY (no commits), Worker commits
 ```
 
-**Prompt template:**
+**Context Agent Teammate Prompt:**
 
 ```
-You are the CONTEXT AGENT for ticket {TICKET_ID}: "{TICKET_TITLE}".
+You are the CONTEXT AGENT (teammate) for ticket {TICKET_ID}: "{TICKET_TITLE}".
 
-## Ticket Description
-{TICKET_DESCRIPTION}
+You are part of an Agent Team with a Worker Agent. You can message each other directly.
 
-## Your Mission
-Research the codebase thoroughly so the implementation agent has everything it needs.
-Find and summarize:
+## Your Role
+You are the CODEBASE EXPERT. Your job is to:
+1. Research the codebase thoroughly BEFORE the Worker starts implementing
+2. STAY ALIVE to answer the Worker's follow-up questions in real-time
+
+## Initial Research (do this immediately)
+Research the codebase and share your findings with the Worker:
 
 1. FILES TO MODIFY — current structure, key functions, line counts
 2. PATTERNS TO FOLLOW — find 2-3 similar implementations, show their exact structure
@@ -668,20 +701,51 @@ Find and summarize:
 7. ADJACENT CODE — modules that import from or are imported by the target files
 8. DEPENDENCIES — other tickets or modules this ticket depends on
 
-## Output Format
-Return structured context with:
-- Exact file paths with line numbers
-- Function signatures and type definitions
-- Copy-paste-ready import statements
-- The specific patterns to replicate
+## Follow-Up Questions
+After sharing your initial research, STAY AVAILABLE. The Worker will message you
+with questions like:
+  - "What's the exact signature of function X in file Y?"
+  - "How do tests in this module mock the database?"
+  - "What error handling pattern does service Z use?"
+  - "Does any existing code handle this edge case?"
+
+When you receive a question:
+  1. READ the actual file (do NOT answer from memory)
+  2. Quote the exact code with file path and line numbers
+  3. If you can't find the answer, say "UNVERIFIED — I could not find this"
+
+## Rules
+- You are READ-ONLY. Do NOT create, modify, or commit any files.
+- Every claim must include file path + line number as evidence.
+- If the Worker asks about something you haven't read, go READ IT then answer.
+- Do NOT guess at function signatures or type definitions.
 ```
+
+**Subagent Fallback Mode:**
+
+If `COORDINATION_MODE == "subagents"`, use sequential handoff instead:
+
+```yaml
+# Task tool parameters (subagent mode only):
+subagent_type: "Explore"
+model: "sonnet"
+isolation: "worktree"     # Gets a clean, isolated view of the codebase
+                          # Auto-cleaned after (read-only — no changes)
+```
+
+The Context Agent runs alone, returns a static report, and its worktree is auto-cleaned.
+The orchestrator then pastes this report into the Worker Agent prompt.
 
 ### Step 2B: Worker Agent (per ticket)
 
-Spawned AFTER the context agent returns. Runs in an **isolated worktree**.
+**Agent Teams Mode (default):** Spawned as a teammate alongside the Context Agent
+in the SAME worktree. Can message the Context Agent directly for follow-up questions.
+
+**Subagent Mode:** Spawned AFTER the context agent returns, in a NEW worktree.
+Receives context as a static text blob in its prompt.
 
 ```yaml
-# Task tool parameters:
+# Subagent mode only — in Agent Teams mode, the team lead handles this:
 subagent_type: "general-purpose"
 model: "opus"
 isolation: "worktree"     # Creates .claude/worktrees/<auto-name>/
@@ -733,8 +797,24 @@ You are the WORKER AGENT implementing ticket {TICKET_ID}: "{TICKET_TITLE}".
   documented here. Do NOT introduce new patterns.
 }
 
-## Codebase Context (from Context Agent)
-{PASTE FULL CONTEXT AGENT OUTPUT HERE}
+## Context Agent Teammate (Agent Teams Mode)
+{IF COORDINATION_MODE == "agent-teams":
+  You have a Context Agent teammate (Sonnet) in this worktree. It has already
+  researched the codebase. You can MESSAGE IT DIRECTLY for follow-up questions:
+  - "What's the exact signature of function X in file Y?"
+  - "How do tests in this module mock the database?"
+  - "What error handling pattern does service Z use?"
+  - "Does any existing code handle this edge case already?"
+  The Context Agent will READ the actual file and respond with evidence.
+  USE THIS instead of guessing at signatures or patterns.
+  DO NOT fabricate function signatures when you can just ASK.
+}
+{IF COORDINATION_MODE == "subagents":
+  ## Codebase Context (from Context Agent)
+  {PASTE FULL CONTEXT AGENT OUTPUT HERE}
+  Note: The Context Agent is no longer alive. You cannot ask follow-up questions.
+  If you need information not covered above, you must read the files yourself.
+}
 
 ## Accumulated Learnings (from progress.txt)
 {PASTE THE CURRENT CONTENTS OF progress.txt — especially the Codebase Patterns section}
@@ -2082,16 +2162,17 @@ The orchestrator itself follows these principles:
 17. **Verify edge cases exist in tests.** Layer 2.5 in the verification loop checks that every edge case from the ticket description has a corresponding test case.
 18. **Run retrospective at sprint end.** Phase 8 is not optional. Learnings feed back to progress.txt, CLAUDE.md, and /tickets memory.
 19. **Never trust Completion Agent's claim about Linear.** The orchestrator MUST independently call Linear MCP to verify the evidence comment exists AND ticket status is "Done". The Completion Agent saying "I posted it" is NOT evidence, the API response showing the comment IS evidence. This is the same philosophy as Layer 2 not trusting Worker claims.
+20. **Agent Teams per ticket by default.** Deploy Context Agent + Worker Agent as teammates in a shared worktree. The orchestrator is team lead. The Worker should ASK the Context Agent for signatures and patterns instead of guessing. Only fall back to sequential subagents if the user explicitly chooses it or `CLAUDE_CODE_EXPERIMENTAL_AGENT_TEAMS` is not set.
 
 ---
 
 ## AGENT INVENTORY
 
-| Agent | Model | Worktree | Task Tool Config | Count | Purpose |
-|-------|-------|----------|-----------------|-------|---------|
-| Context Agent | Sonnet 4.6 | `isolation: "worktree"` (auto-cleaned) | `subagent_type: "Explore"` | 1 per ticket | Codebase research |
-| Worker Agent | Opus 4.6 | `isolation: "worktree"` (preserved) | `subagent_type: "general-purpose"` | 1 per ticket | Implementation + edge cases + evidence |
-| Fresh Worker Agent | Opus 4.6 | `isolation: "worktree"` (new) | `subagent_type: "general-purpose"` | 0-1 per ticket | Circuit breaker escalation — clean context |
+| Agent | Model | Worktree | Mode | Count | Purpose |
+|-------|-------|----------|------|-------|---------|
+| Context Agent | Sonnet 4.6 | Shared worktree (teammate, read-only) | Agent Teams (default) | 1 per ticket | Codebase research + live follow-up answers |
+| Worker Agent | Opus 4.6 | Shared worktree (teammate, commits) | Agent Teams (default) | 1 per ticket | Implementation + edge cases + evidence |
+| Fresh Worker Agent | Opus 4.6 | `isolation: "worktree"` (new) | Both modes | 0-1 per ticket | Circuit breaker escalation, clean context |
 | Code Simplifier | Opus 4.6 | `resume: "{worker_agent_id}"` (same worktree) | `subagent_type: "code-simplifier:code-simplifier"` | 1 per ticket | Refine code clarity, non-blocking |
 | Verification Agent | Sonnet 4.6 | None — runs commands on worktree branch | `subagent_type: "general-purpose"` | 1+ per ticket | Independent verification + cross-check |
 | Code Review Agent | Sonnet 4.6 | None — reads worktree branch via git diff | `subagent_type: "general-purpose"` | 1+ per ticket | Security, logic, patterns |
@@ -2105,14 +2186,17 @@ The orchestrator itself follows these principles:
 
 **All agents receive ANTI-HALLUCINATION RULES in their prompt. No exceptions.**
 **Workers receive enriched ticket context (edge cases, file context, contracts, test patterns).**
+**In Agent Teams mode, Context + Worker are teammates in the same worktree with direct messaging.**
 
 ### Worktree Lifecycle Per Ticket
 
+**Agent Teams Mode (default):**
 ```
-Context Agent ─── worktree created ─── reads codebase ─── worktree AUTO-REMOVED (no changes)
-                                                              │
-Worker Agent  ─── worktree created ─── implements ─── commits ─── worktree PRESERVED
-                                                                       │
+┌─── SHARED WORKTREE ──────────────────────────────────────────────┐
+│ Context Agent (Sonnet) ◄──► Worker Agent (Opus)                  │
+│ reads codebase, answers Qs    implements, writes tests, commits  │
+└──────────────────────────────────────────────────┬───────────────┘
+                                                   │ (worktree PRESERVED)
 Fix Agent     ─── RESUMES worker ─── same worktree ─── commits fix ───┘
                                                                        │
 Merge         ─── merges branch to {BRANCH_BASE} ─── worktree REMOVED ┘

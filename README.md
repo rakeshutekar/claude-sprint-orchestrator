@@ -1,6 +1,6 @@
 # Claude Sprint Orchestrator
 
-A multi-agent sprint orchestration system for [Claude Code](https://docs.anthropic.com/en/docs/claude-code) that turns Linear tickets into fully implemented, verified, and merged code — using paired AI agents working in parallel isolated git worktrees.
+A multi-agent sprint orchestration system for [Claude Code](https://docs.anthropic.com/en/docs/claude-code) that turns Linear tickets into fully implemented, verified, and merged code, using Agent Teams (Context Agent + Worker Agent as live teammates) working in parallel isolated git worktrees.
 
 > **Two slash commands. One pipeline.** `/tickets` plans your work. `/sprint` executes it.
 
@@ -23,8 +23,8 @@ The system is built around two Claude Code custom slash commands that form an en
       ▼
   /sprint
       │
-      │  Fetches tickets → deploys agent pairs per ticket →
-      │  implements in isolated worktrees → 5-layer verification →
+      │  Fetches tickets → deploys Agent Teams per ticket →
+      │  Context + Worker as live teammates → 5-layer verification →
       │  conflict-aware merging → E2E behavioral testing →
       │  auto-retrospective
       │
@@ -171,13 +171,13 @@ Each ticket created on Linear includes:
 
 ## `/sprint` — Parallel Agent Execution
 
-The execution command. Fetches tickets from Linear, deploys paired agents per ticket in isolated git worktrees, runs multi-layer verification, merges with conflict prediction, and runs E2E behavioral testing.
+The execution command. Fetches tickets from Linear, deploys Agent Teams per ticket (Context Agent + Worker Agent as live teammates in a shared worktree), runs multi-layer verification, merges with conflict prediction, and runs E2E behavioral testing.
 
 ### What It Does
 
-1. **Pre-flight** — Validates Linear MCP, git state, baseline build. User chooses coordination mode (Subagents vs Agent Teams). Initializes sprint-state.json checkpoints
+1. **Pre-flight** — Validates Linear MCP, git state, baseline build. User chooses coordination mode (Agent Teams recommended, Subagents fallback). Initializes sprint-state.json checkpoints
 2. **Fetch tickets** — Queries Linear for matching tickets
-3. **Deploy agent pairs** — Per ticket: Context Agent (Sonnet) researches → Worker Agent (Opus) implements in isolated worktree with enriched ticket context
+3. **Deploy Agent Teams** — Per ticket: orchestrator (team lead) spawns Context Agent (Sonnet) + Worker Agent (Opus) as teammates in a shared worktree. They communicate directly, the Worker asks follow-up questions, the Context Agent reads files on demand
 4. **Code simplifier** — Optional refine pass for clarity before verification
 5. **5-layer verification loop** — Evidence check → Independent verification → Edge case verification → Code review → Human review (optional) → Completion with evidence → Linear update
 6. **Merge scheduling** — Conflict prediction via file overlap analysis, intent context for resolution, post-merge verification
@@ -191,7 +191,7 @@ The execution command. Fetches tickets from Linear, deploys paired agents per ti
 ┌─────────────────────────────────────────────────────────────────────┐
 │                        PHASE 0: PRE-FLIGHT                          │
 │  Check Linear → Pull base → Build baseline → Tag snapshot           │
-│  Choose coordination mode (Subagents vs Agent Teams)                │
+│  Choose coordination mode (Agent Teams recommended)                 │
 │  Initialize sprint-state.json (checkpoint system)                    │
 └───────────────────────────────┬─────────────────────────────────────┘
                                 │
@@ -203,22 +203,22 @@ The execution command. Fetches tickets from Linear, deploys paired agents per ti
 └───────────────────────────────┬─────────────────────────────────────┘
                                 │
                     ┌───────────┼───────────┐
-                    ▼           ▼           ▼        (one pair per ticket)
+                    ▼           ▼           ▼     (one Agent Team per ticket)
 ┌──────────────────────────────────────────────────────────────────┐
-│              PHASE 2: DEPLOY AGENT PAIRS (PARALLEL)              │
+│           PHASE 2: DEPLOY AGENT TEAMS (PARALLEL)                 │
 │                                                                  │
 │  ┌──────────────────────────────────────────────────────────┐    │
-│  │  PER TICKET — ISOLATED WORKTREE                          │    │
+│  │  PER TICKET — SHARED WORKTREE (Agent Team)               │    │
 │  │                                                          │    │
-│  │  ┌─────────────────┐     context      ┌──────────────┐  │    │
-│  │  │  CONTEXT AGENT   │───────────────▶│  WORKER AGENT │  │    │
-│  │  │  (Sonnet 4.6)   │    output        │  (Opus 4.6)  │  │    │
-│  │  │                 │                  │              │  │    │
-│  │  │  • Read codebase │                  │  • Implement │  │    │
-│  │  │  • Map patterns  │                  │  • Write tests│  │    │
-│  │  │  • Find deps     │                  │  • Lint/type  │  │    │
-│  │  │  • Summarize     │                  │  • Commit     │  │    │
-│  │  └─────────────────┘                  └──────────────┘  │    │
+│  │  ┌─────────────────┐  ◄── messages ──►  ┌────────────┐  │    │
+│  │  │  CONTEXT AGENT   │   (real-time)      │  WORKER    │  │    │
+│  │  │  (Sonnet 4.6)   │                     │  (Opus 4.6)│  │    │
+│  │  │                 │  W: "signature?"    │            │  │    │
+│  │  │  • Read codebase │  C: "fn(x:T):R"   │  • Implement│  │    │
+│  │  │  • Map patterns  │  W: "test mock?"   │  • Write tests│ │    │
+│  │  │  • Answer Qs     │  C: "vi.mock(...)" │  • Lint/type│  │    │
+│  │  │  • Stay alive    │                     │  • Commit   │  │    │
+│  │  └─────────────────┘                     └────────────┘  │    │
 │  │                                                          │    │
 │  └──────────────────────────────────────────────────────────┘    │
 │                                                                  │
@@ -290,8 +290,8 @@ The execution command. Fetches tickets from Linear, deploys paired agents per ti
 
 | Agent | Model | Purpose |
 |-------|-------|---------|
-| Context Agent | Sonnet | Codebase research per ticket |
-| Worker Agent | Opus | Implementation + edge cases + evidence |
+| Context Agent | Sonnet | Codebase research + live follow-up answers (teammate) |
+| Worker Agent | Opus | Implementation + edge cases + evidence (teammate) |
 | Fresh Worker Agent | Opus | Circuit breaker escalation — clean context |
 | Code Simplifier | Opus | Refine code clarity (non-blocking) |
 | Verification Agent | Sonnet | Independent verification + cross-check |
@@ -306,8 +306,8 @@ The execution command. Fetches tickets from Linear, deploys paired agents per ti
 
 ### Key Features
 
-- **Paired agents** — Sonnet for context, Opus for implementation, per ticket
-- **Isolated git worktrees** — Each ticket gets its own worktree via Claude Code's native worktree support
+- **Agent Teams per ticket** — Context Agent (Sonnet) + Worker Agent (Opus) as live teammates in a shared worktree. The Worker asks follow-up questions, the Context Agent reads files on demand. No lossy context handoff.
+- **Isolated git worktrees** — Each ticket team gets its own worktree via Claude Code's native worktree support
 - **Circuit breaker** — Detects stuck agents (same error 2x), escalates to fresh agent or flags for manual intervention
 - **Error classification** — Routes failures intelligently: rate limits → wait, missing files → re-context, type errors → code fix
 - **Sprint-state.json checkpoints** — Persists state across context compaction events with recovery protocol
@@ -319,7 +319,7 @@ The execution command. Fetches tickets from Linear, deploys paired agents per ti
 - **Sprint dashboard** — Live `.claude/sprint-dashboard.md` for observability
 - **Post-sprint learning loop** — Auto-retrospective feeds learnings back to progress.txt, CLAUDE.md, and /tickets memory
 - **Human-in-loop mode** — Optional pause for human review before marking tickets Done
-- **Coordination mode choice** — Runtime prompt to choose between Subagents (recommended) and Agent Teams (experimental)
+- **Coordination mode choice** — Agent Teams by default, Subagents as lower-cost fallback
 
 ---
 
@@ -454,23 +454,24 @@ Now execute the orchestration.
 
 At sprint start, you choose between two coordination modes:
 
-### Subagents (Recommended)
+### Agent Teams (Recommended)
 
-Each agent runs independently. The orchestrator passes all context between them. Agents cannot talk to each other.
+Per ticket, the orchestrator (team lead) spawns a Context Agent (Sonnet) and Worker Agent (Opus) as teammates in the same worktree. Both agents are alive simultaneously and communicate directly.
+
+- The Worker can ASK the Context Agent for exact function signatures, test patterns, error handling conventions in real-time
+- No lossy context transfer. The Context Agent stays alive with full codebase knowledge
+- Reduces verification loop iterations because the Worker gets better information upfront
+- Higher token cost (Context Agent stays alive during implementation) but fewer retries
+- Requires `CLAUDE_CODE_EXPERIMENTAL_AGENT_TEAMS=1`
+
+### Subagents (Fallback, lower cost)
+
+Each agent runs independently. The orchestrator passes all context between them as a one-way handoff. The Context Agent runs first, returns a text summary, and dies. The Worker receives that static summary in its prompt and cannot ask follow-up questions.
 
 - Lower token cost (~$2-5 per ticket)
-- Predictable, sequential verification flow
+- Predictable, sequential flow
 - Works with any Claude Code version
-- Best for independent tickets with few cross-ticket dependencies
-
-### Agent Teams (Experimental)
-
-Agents run as a coordinated team with direct inter-agent messaging.
-
-- Higher token cost but better coordination
-- Agents can message each other and share discoveries
-- Requires `CLAUDE_CODE_EXPERIMENTAL_AGENT_TEAMS=1`
-- Best for tightly coupled tickets, shared services, cross-feature integration
+- Best when you want to minimize token spend on simple, well-defined tickets
 
 ---
 
