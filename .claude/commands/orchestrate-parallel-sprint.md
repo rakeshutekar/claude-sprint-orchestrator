@@ -192,12 +192,19 @@ echo ".claude/worktrees/" >> .gitignore && git add .gitignore && git commit -m "
 │       INCOMPLETE → resume Worker   │  │   │    │    │
 │       COMPLETE ↓                   │  │   │    │    │
 │                                    │  │   │    │    │
-│  Layer 5: LINEAR VERIFICATION      │  │   │    │    │
-│  └── Orchestrator checks Linear:   │  │   │    │    │
+│  Layer 5: EVIDENCE COMMENT GATE    │  │   │    │    │
+│  └── ORCHESTRATOR checks Linear:   │  │   │    │    │
+│       (independent API call,       │  │   │    │    │
+│        does NOT trust agent claim) │  │   │    │    │
 │       • Evidence comment exists?   │  │   │    │    │
 │       • Has required sections?     │  │   │    │    │
+│       MISSING → resume Agent ──────┤  │   │    │    │
+│       FOUND ↓                      │  │   │    │    │
+│                                    │  │   │    │    │
+│  Layer 5.5: STATUS GATE            │  │   │    │    │
+│  └── ORCHESTRATOR checks Linear:   │  │   │    │    │
 │       • Status == "Done"?          │  │   │    │    │
-│       ANY MISSING → resume Agent ──┤  │   │    │    │
+│       NOT DONE → resume Agent ─────┤  │   │    │    │
 │       ALL VERIFIED ↓               │  │   │    │    │
 │       ┌────────────────────┐  ┌────┴──┴───┴────┴──┐ │
 │       │ TICKET PROVEN DONE │  │  FIX AGENT        │ │
@@ -1200,8 +1207,11 @@ For EACH requirement/acceptance criterion in the ticket:
 ## Decision
 - If ALL requirements have ✓ AND all evidence shows PASS:
   → STATUS: COMPLETE
-  → Use Linear MCP to update ticket status to "Done"
-  → Add a comment on the Linear ticket with this EXACT format:
+  → Add a comment on the Linear ticket with this EXACT format (DO THIS FIRST):
+  → IMPORTANT: Post the comment BEFORE changing ticket status. The orchestrator
+    will independently verify the comment exists. If you skip this, the ticket
+    will be sent back to you.
+  → After comment is posted, THEN use Linear MCP to update ticket status to "Done"
 
     "## Implementation Complete ✓
 
@@ -1396,36 +1406,56 @@ while loop_count < MAX_LOOPS:
     completion = run Completion Agent
     if completion.STATUS == "COMPLETE":
 
-        # ─── Layer 5: LINEAR EVIDENCE VERIFICATION ───
-        linear_comments = fetch latest comments on {TICKET_ID} via Linear MCP
-        evidence_comment = find comment containing "## Implementation Complete ✓"
+        # ─── Layer 5: ORCHESTRATOR VERIFIES COMMENT EXISTS (HARD GATE) ───
+        # The Completion Agent CLAIMS it posted the comment. We do NOT trust claims.
+        # The orchestrator independently checks Linear, same philosophy as Layer 2.
+        WAIT 3 seconds  # Give Linear API time to propagate
+
+        linear_comments = ORCHESTRATOR fetches comments on {TICKET_ID} via Linear MCP
+        # This is the ORCHESTRATOR making the API call, NOT the Completion Agent.
+        # The agent's self-report is irrelevant — only the API response matters.
+
+        evidence_comment = find comment containing "## Implementation Complete"
 
         if evidence_comment is NOT found:
-            LOG ERROR: "Completion Agent claimed COMPLETE but no evidence comment on Linear"
-            resume Completion Agent → "You claimed the ticket is complete but the evidence comment is MISSING from Linear. Post the evidence comment NOW."
+            LOG ERROR: "LAYER 5 HARD GATE FAILED: No evidence comment found on Linear for {TICKET_ID}"
+            LOG ERROR: "Completion Agent claimed COMPLETE but orchestrator cannot find the comment"
+            resume Completion Agent → "CRITICAL: The orchestrator independently checked Linear and your evidence comment is NOT THERE. The comment with '## Implementation Complete ✓' does not exist on the ticket. You MUST post it NOW using Linear MCP addComment. Do NOT claim you already posted it — the API shows it is missing."
             loop_count += 1
+            last_error = { type: "missing_evidence_comment", message: "Completion Agent did not post evidence comment" }
+            consecutive_same_error = (last_error?.type == "missing_evidence_comment") ? consecutive_same_error + 1 : 1
             update sprint-state.json
             continue
 
         if evidence_comment missing "### Evidence" OR missing "### Requirements Matched":
-            LOG ERROR: "Evidence comment exists but is incomplete"
-            resume Completion Agent → "Evidence comment is missing required sections."
+            LOG ERROR: "Evidence comment exists but is incomplete — missing required sections"
+            resume Completion Agent → "Evidence comment found but is INCOMPLETE. Required sections: '### Evidence' AND '### Requirements Matched'. Re-post the full comment."
             loop_count += 1
             update sprint-state.json
             continue
 
-        ticket_status = fetch {TICKET_ID} status via Linear MCP
+        LOG: "Layer 5 PASSED: Evidence comment verified on Linear for {TICKET_ID}"
+
+        # ─── Layer 5.5: ORCHESTRATOR VERIFIES TICKET STATUS (HARD GATE) ───
+        # Same principle: orchestrator checks status independently.
+        ticket_status = ORCHESTRATOR fetches {TICKET_ID} status via Linear MCP
+
         if ticket_status != "Done":
-            LOG ERROR: "Ticket not marked Done on Linear"
-            resume Completion Agent → "Ticket is not marked Done on Linear. Mark it Done NOW."
+            LOG ERROR: "LAYER 5.5 HARD GATE FAILED: Ticket {TICKET_ID} status is '{ticket_status}', not 'Done'"
+            resume Completion Agent → "CRITICAL: The orchestrator checked Linear and ticket status is '{ticket_status}', NOT 'Done'. Mark it Done NOW using Linear MCP."
             loop_count += 1
+            last_error = { type: "ticket_not_done", message: "Status is {ticket_status}" }
             update sprint-state.json
             continue
 
-        # ALL VERIFIED — ticket is genuinely complete
+        LOG: "Layer 5.5 PASSED: Ticket {TICKET_ID} confirmed 'Done' on Linear"
+
+        # ─── ALL INDEPENDENTLY VERIFIED — ticket is genuinely complete ───
         ticket_state = "complete"
         update sprint-state.json: tickets[{TICKET_ID}].status = "complete"
+        update sprint-state.json: tickets[{TICKET_ID}].evidence_comment_verified = true
         update sprint-dashboard.md (if SPRINT_DASHBOARD enabled)
+        LOG: "TICKET {TICKET_ID} PROVEN COMPLETE — evidence comment ✓, status Done ✓"
         break
 
     else:
@@ -2051,6 +2081,7 @@ The orchestrator itself follows these principles:
 16. **Pass enriched ticket context to workers.** If the ticket description has Edge Cases, File Context, Contracts, or Test Patterns sections, paste them directly into the Worker Agent prompt. Workers should never guess at signatures.
 17. **Verify edge cases exist in tests.** Layer 2.5 in the verification loop checks that every edge case from the ticket description has a corresponding test case.
 18. **Run retrospective at sprint end.** Phase 8 is not optional. Learnings feed back to progress.txt, CLAUDE.md, and /tickets memory.
+19. **Never trust Completion Agent's claim about Linear.** The orchestrator MUST independently call Linear MCP to verify the evidence comment exists AND ticket status is "Done". The Completion Agent saying "I posted it" is NOT evidence, the API response showing the comment IS evidence. This is the same philosophy as Layer 2 not trusting Worker claims.
 
 ---
 
@@ -2175,8 +2206,9 @@ echo "Cleanup complete."
     [ ] Layer 3: Code review passed (CRITICAL=0, HIGH=0)
     [ ] Layer 3.5: Human review completed (if HUMAN_IN_LOOP=true)
     [ ] Layer 4: Completion agent matched all requirements with evidence
-    [ ] Layer 5: Evidence comment verified on Linear (orchestrator checked)
-    [ ] Layer 5: Ticket status confirmed "Done" on Linear (orchestrator checked)
+    [ ] Layer 5: ORCHESTRATOR independently verified evidence comment exists on Linear (hard gate)
+    [ ] Layer 5: Evidence comment contains "### Evidence" AND "### Requirements Matched"
+    [ ] Layer 5.5: ORCHESTRATOR independently verified ticket status == "Done" on Linear (hard gate)
     [ ] Zero evidence mismatches detected across all tickets
     [ ] Circuit breaker: No ticket exceeded 2x same-error (or escalated to fresh agent)
     [ ] sprint-state.json updated per ticket (loop_count, status, last_error if any)
