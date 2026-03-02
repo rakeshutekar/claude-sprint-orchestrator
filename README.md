@@ -24,7 +24,7 @@ The system is built around two Claude Code custom slash commands that form an en
   /sprint
       │
       │  Fetches tickets → deploys Agent Teams per ticket →
-      │  Context + Worker as live teammates → 5-layer verification →
+      │  Context + Worker as live teammates → multi-layer verification →
       │  conflict-aware merging → E2E behavioral testing →
       │  auto-retrospective
       │
@@ -179,7 +179,7 @@ The execution command. Fetches tickets from Linear, deploys Agent Teams per tick
 2. **Fetch tickets** — Queries Linear for matching tickets
 3. **Deploy Agent Teams** — Per ticket: orchestrator (team lead) spawns Context Agent (Sonnet) + Worker Agent (Opus) as teammates in a shared worktree. They communicate directly, the Worker asks follow-up questions, the Context Agent reads files on demand
 4. **Code simplifier** — Optional refine pass for clarity before verification
-5. **5-layer verification loop** — Evidence check → Independent verification → Edge case verification → Code review → Human review (optional) → Completion with evidence → Linear update
+5. **Multi-layer verification loop** — Evidence check → Independent verification → Edge case verification → Code review → Human review (optional) → Completion with evidence → Orchestrator independently verifies evidence comment on Linear (Layer 5) → Orchestrator independently verifies ticket status (Layer 5.5)
 6. **Merge scheduling** — Conflict prediction via file overlap analysis, intent context for resolution, post-merge verification
 7. **Build gate** — Full quality gate with bisection protocol for failure isolation
 8. **E2E behavioral verification** — Per-ticket endpoint testing, DB state checks, integration verification
@@ -241,7 +241,8 @@ The execution command. Fetches tickets from Linear, deploys Agent Teams per tick
 │  Layer 3: CODE REVIEW AGENT (security, logic, patterns)            │
 │  Layer 3.5: HUMAN REVIEW (optional, if HUMAN_IN_LOOP=true)        │
 │  Layer 4: COMPLETION AGENT (requirement matching + evidence)       │
-│  Layer 5: LINEAR VERIFICATION (evidence comment + status check)    │
+│  Layer 5: EVIDENCE COMMENT GATE (orchestrator verifies on Linear)  │
+│  Layer 5.5: STATUS GATE (orchestrator verifies Done on Linear)     │
 │                                                                     │
 └───────────────────────────────┬─────────────────────────────────────┘
                                 │
