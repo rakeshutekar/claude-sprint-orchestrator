@@ -1,0 +1,7 @@
+.claude/worktrees/
+.claude/sprint-state.json
+.claude/sprint-dashboard.md
+.claude/sprint-history/
+.claude/agent-memory/
+.claude/plans/
+progress.txt
