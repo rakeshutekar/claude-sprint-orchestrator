@@ -179,7 +179,7 @@ The execution command. Fetches tickets from Linear, deploys Agent Teams per tick
 2. **Fetch tickets** — Queries Linear for matching tickets
 3. **Deploy Agent Teams** — Per ticket: orchestrator (team lead) spawns Context Agent (Sonnet) + Worker Agent (Opus) as teammates in a shared worktree. They communicate directly, the Worker asks follow-up questions, the Context Agent reads files on demand
 4. **Code simplifier** — Optional refine pass for clarity before verification
-5. **Multi-layer verification loop** — Evidence check → Independent verification → Edge case verification → Code review → Human review (optional) → Completion with evidence → Orchestrator independently verifies evidence comment on Linear (Layer 5) → Orchestrator independently verifies ticket status (Layer 5.5)
+5. **Multi-layer verification loop** — Evidence check → Independent verification → Edge case verification → Code review → Human review (optional) → Completion verdict → Orchestrator assembles raw proof and posts to Linear (Layer 5) → Orchestrator marks Done and verifies (Layer 5.5)
 6. **Merge scheduling** — Conflict prediction via file overlap analysis, intent context for resolution, post-merge verification
 7. **Build gate** — Full quality gate with bisection protocol for failure isolation
 8. **E2E behavioral verification** — Per-ticket endpoint testing, DB state checks, integration verification
@@ -240,9 +240,9 @@ The execution command. Fetches tickets from Linear, deploys Agent Teams per tick
 │  ⚡ CIRCUIT BREAKER: same error 2x → fresh agent or flag STUCK     │
 │  Layer 3: CODE REVIEW AGENT (security, logic, patterns)            │
 │  Layer 3.5: HUMAN REVIEW (optional, if HUMAN_IN_LOOP=true)        │
-│  Layer 4: COMPLETION AGENT (requirement matching + evidence)       │
-│  Layer 5: EVIDENCE COMMENT GATE (orchestrator verifies on Linear)  │
-│  Layer 5.5: STATUS GATE (orchestrator verifies Done on Linear)     │
+│  Layer 4: COMPLETION AGENT (verdict only, no Linear access)        │
+│  Layer 5: ORCHESTRATOR POSTS PROOF (raw terminal output to Linear) │
+│  Layer 5.5: ORCHESTRATOR MARKS DONE (sets + verifies on Linear)    │
 │                                                                     │
 └───────────────────────────────┬─────────────────────────────────────┘
                                 │
@@ -298,7 +298,7 @@ The execution command. Fetches tickets from Linear, deploys Agent Teams per tick
 | Verification Agent | Sonnet | Independent verification + cross-check |
 | Code Review Agent | Sonnet | Security, logic, patterns |
 | Fix Agent | Opus | Fix verification/review/human issues |
-| Completion Agent | Sonnet | Evidence-based requirement matching |
+| Completion Agent | Sonnet | Requirement matching verdict only (no Linear access) |
 | Scheduler Agent | Sonnet | Conflict prediction + merge ordering |
 | Conflict Agent | Opus | Resolve merges with intent context |
 | Build Gate Agent | Opus | Fix build failures (after bisection) |
@@ -348,15 +348,15 @@ Injected into every agent prompt:
 - **Strict evidence format** — COMMAND → EXIT_CODE → OUTPUT → VERDICT
 - **Compaction safety** — Re-run verification after context compaction
 
-### Trust Boundary: Collaborators vs Auditors
+### Trust Boundary: Only the Orchestrator Touches Linear
 
-The system enforces a strict separation between agents that build and agents that verify:
+The system enforces a strict rule: **no agent interacts with Linear**. Only the orchestrator does.
 
-- **Collaborators** (Agent Team: Context Agent + Worker Agent) — implement the ticket in a shared worktree. They are restricted from interacting with Linear MCP. They cannot mark tickets Done, post comments, or change status.
-- **Auditors** (Verification Agent, Code Review Agent, Completion Agent) — run as independent subagents regardless of coordination mode. Only the Completion Agent may post evidence comments and change ticket status on Linear.
-- **Hard gates** (Layer 5, Layer 5.5) — the orchestrator independently verifies on Linear that the evidence comment exists and the ticket status is Done. It never trusts agent self-reports.
+- **Collaborators** (Agent Team: Context Agent + Worker Agent) — implement the ticket in a shared worktree. Restricted from Linear MCP.
+- **Auditors** (Verification Agent, Code Review Agent, Completion Agent) — run as independent subagents. Also restricted from Linear MCP. They return structured results to the orchestrator.
+- **Orchestrator** (Layer 5, 5.5) — assembles raw terminal output from Verification and Code Review agents, adds the Completion Agent's requirement table, and posts the evidence comment to Linear directly. Then marks the ticket Done and verifies.
 
-This prevents the Agent Team from short-circuiting the verification pipeline by marking tickets Done directly.
+Raw terminal output IS proof. Agent-written summaries are NOT proof. The orchestrator captures what the agents actually ran (build output, test output, lint output) and posts that as evidence, not a summary an agent wrote about it.
 
 ---
 
@@ -530,7 +530,7 @@ Each ticket spawns **multiple agents** across the pipeline:
 - 1+ Verification Agent (Sonnet) — independent verification
 - 1+ Code Review Agent (Sonnet) — security/quality check
 - 0-N Fix Agents (Opus) — if issues found
-- 1 Completion Agent (Sonnet) — requirement matching
+- 1 Completion Agent (Sonnet) — requirement matching verdict (no Linear access)
 - 1 E2E Test Agent (Sonnet) — behavioral verification
 
 Plus global agents: Scheduler, Conflict Resolution, Build Gate, Retrospective.

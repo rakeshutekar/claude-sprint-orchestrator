@@ -188,27 +188,27 @@ echo ".claude/worktrees/" >> .gitignore && git add .gitignore && git commit -m "
 │       Approved ↓                       │  │   │    │    │
 │                                        │  │   │    │    │
 │  Layer 4: COMPLETION AGENT (Sonnet 4.6)│  │   │    │    │
-│  └── Requirement matching + evidence ──┤  │   │    │    │
+│  └── Verdict only (no Linear access)──┤  │   │    │    │
 │       INCOMPLETE → resume Worker   │  │   │    │    │
 │       COMPLETE ↓                   │  │   │    │    │
 │                                    │  │   │    │    │
-│  Layer 5: EVIDENCE COMMENT GATE    │  │   │    │    │
-│  └── ORCHESTRATOR checks Linear:   │  │   │    │    │
-│       (independent API call,       │  │   │    │    │
-│        does NOT trust agent claim) │  │   │    │    │
-│       • Evidence comment exists?   │  │   │    │    │
-│       • Has required sections?     │  │   │    │    │
-│       MISSING → resume Agent ──────┤  │   │    │    │
-│       FOUND ↓                      │  │   │    │    │
+│  Layer 5: ORCHESTRATOR POSTS PROOF │  │   │    │    │
+│  └── Assembles raw terminal output │  │   │    │    │
+│       from Verification + Review   │  │   │    │    │
+│       + Completion requirement tbl │  │   │    │    │
+│       Posts evidence comment to    │  │   │    │    │
+│       Linear via MCP (directly)    │  │   │    │    │
+│       FAILED → retry or STUCK ─────┤  │   │    │    │
+│       POSTED ↓                     │  │   │    │    │
 │                                    │  │   │    │    │
-│  Layer 5.5: STATUS GATE            │  │   │    │    │
-│  └── ORCHESTRATOR checks Linear:   │  │   │    │    │
-│       • Status == "Done"?          │  │   │    │    │
-│       NOT DONE → resume Agent ─────┤  │   │    │    │
+│  Layer 5.5: ORCHESTRATOR MARKS DONE│  │   │    │    │
+│  └── Sets status to Done on Linear │  │   │    │    │
+│       Verifies status changed      │  │   │    │    │
+│       NOT DONE → retry or STUCK ───┤  │   │    │    │
 │       ALL VERIFIED ↓               │  │   │    │    │
 │       ┌────────────────────┐  ┌────┴──┴───┴────┴──┐ │
 │       │ TICKET PROVEN DONE │  │  FIX AGENT        │ │
-│       │ Evidence on Linear │  │  (Opus 4.6)       │ │
+│       │ Raw proof on Linear│  │  (Opus 4.6)       │ │
 │       └────────┬───────────┘  │  resume: worker_id│ │
 │                │              └───────────────────┘  │
 │                │ done                                 │
@@ -1014,25 +1014,30 @@ REGARDLESS of COORDINATION_MODE (agent-teams or subagents):
    - It does NOT change the verification chain. Every ticket goes through
      Layer 1 → Layer 2 → Layer 2.5 → Layer 3 → Layer 3.5 → Layer 4 → Layer 5 → Layer 5.5.
 
-3. ONLY the Completion Agent (Layer 4) may post comments on Linear.
-   ONLY the Completion Agent (Layer 4) may change ticket status to Done.
-   The orchestrator (Layer 5, 5.5) independently verifies both actions happened.
+3. NO AGENT may post comments on Linear or change ticket status.
+   ONLY the ORCHESTRATOR (Layer 5, 5.5) posts evidence and marks Done.
+   The Completion Agent returns a VERDICT (COMPLETE/INCOMPLETE). That's it.
 
-4. The Agent Team (Context Agent + Worker Agent) MUST NOT:
+4. ALL agents (Context, Worker, Verification, Code Review, Completion) MUST NOT:
    - Post comments on Linear
    - Change ticket status on Linear
    - Mark tickets as Done
    - Use any Linear MCP tools
-   Their job is to IMPLEMENT and return WORKER_RESULT. Nothing more.
+   Agents analyze, implement, and return results. Only the orchestrator touches Linear.
 
 5. After the Agent Team returns WORKER_RESULT, the orchestrator MUST:
    a. Enter the Loop Logic (Phase 3) for that ticket
    b. Run ALL verification layers as independent subagents
-   c. Only mark complete after Layer 5.5 passes
+   c. CAPTURE raw output from Verification Agent and Code Review Agent
+   d. Run Completion Agent for verdict (it returns COMPLETE/INCOMPLETE, nothing else)
+   e. If COMPLETE: orchestrator assembles evidence from raw outputs and posts to Linear
+   f. Orchestrator marks ticket Done on Linear
+   g. Only mark complete in sprint-state.json after Layer 5.5 passes
 
 IF YOU ARE THE ORCHESTRATOR AND YOU ARE READING THIS AFTER AN AGENT TEAM COMPLETED:
 → Do NOT skip to Phase 4.
 → Do NOT assume the ticket is done because the team said so.
+→ No agent posts to Linear. YOU post the evidence. YOU mark Done.
 → Extract WORKER_RESULT and enter the verification loop NOW.
 ```
 
@@ -1309,9 +1314,11 @@ The code review agent found issues:
 7. Report WORKER_RESULT with updated evidence
 ```
 
-### Step 3E: Completion Agent (with evidence-before-assertion)
+### Step 3E: Completion Agent (verdict only — no Linear access)
 
 Runs ONLY after BOTH Verification Agent AND Code Review pass.
+**This agent does NOT touch Linear.** It returns a structured verdict. The orchestrator
+assembles evidence from raw agent outputs and posts the proof comment itself.
 
 ```yaml
 subagent_type: "general-purpose"
@@ -1324,6 +1331,13 @@ model: "sonnet"
 You are the COMPLETION AGENT for ticket {TICKET_ID}: "{TICKET_TITLE}".
 
 {PASTE ANTI-HALLUCINATION RULES FROM GUARDRAILS SECTION}
+
+## LINEAR MCP RESTRICTION (CRITICAL)
+- You do NOT have permission to interact with Linear in ANY way.
+- Do NOT change ticket status. Do NOT post comments. Do NOT mark tickets Done.
+- Do NOT use any Linear MCP tools (createComment, updateIssue, etc.)
+- Your ONLY job is to analyze evidence and return a structured verdict.
+- The orchestrator will handle all Linear interactions based on your verdict.
 
 ## THE EVIDENCE RULE
 You may NOT claim this ticket is complete unless you have:
@@ -1348,35 +1362,13 @@ For EACH requirement/acceptance criterion in the ticket:
 
 ## Decision
 - If ALL requirements have ✓ AND all evidence shows PASS:
-  → STATUS: COMPLETE
-  → Add a comment on the Linear ticket with this EXACT format (DO THIS FIRST):
-  → IMPORTANT: Post the comment BEFORE changing ticket status. The orchestrator
-    will independently verify the comment exists. If you skip this, the ticket
-    will be sent back to you.
-  → After comment is posted, THEN use Linear MCP to update ticket status to "Done"
-
-    "## Implementation Complete ✓
-
-    **Branch:** {WORKTREE_BRANCH}
-    **Commit:** {commit_hash}
-
-    ### Evidence
-    - Build: ✓ (0 errors)
-    - Lint: ✓ (0 errors, 0 warnings)
-    - Typecheck: ✓ (0 errors)
-    - Tests: ✓ ({N} passing, 0 failed)
-    - Code Review: ✓ (0 critical, 0 high)
-
-    ### Requirements Matched
-    {paste the requirement table}
-
-    ### Files Changed
-    {list of files}"
-
-  → NEVER mark Done without attaching this evidence comment.
+  → Return STATUS: COMPLETE
+  → Return the full requirement table
+  → Return the list of files changed
+  → DO NOT post anything to Linear. DO NOT change ticket status.
 
 - If ANY requirement has ✗:
-  → STATUS: INCOMPLETE
+  → Return STATUS: INCOMPLETE
   → List exactly what's missing
   → This triggers another Worker Agent pass
 ```
@@ -1467,6 +1459,8 @@ while loop_count < MAX_LOOPS:
 
     # ─── Layer 2: Verification Agent (independent execution) ───
     verification = run Verification Agent
+    # CAPTURE raw output for evidence assembly (Layer 5)
+    VERIFICATION_RAW_OUTPUT = verification.RAW_TERMINAL_OUTPUT  # from Task tool return
     if verification.VERIFIED == false:
         current_error = classify_error(verification.failures)
         if current_error.type == last_error?.type:
@@ -1507,6 +1501,8 @@ while loop_count < MAX_LOOPS:
 
     # ─── Layer 3: Code Review Agent ───
     review = run Code Review Agent
+    # CAPTURE raw output for evidence assembly (Layer 5)
+    CODE_REVIEW_RAW_OUTPUT = review.RAW_OUTPUT  # from Task tool return
     if review.PASS == false:
         current_error = { type: "code_review", message: review.issues_summary }
         if current_error.type == last_error?.type:
@@ -1544,60 +1540,102 @@ while loop_count < MAX_LOOPS:
             continue
         # If "Approve" or "Skip" → proceed to Layer 4
 
-    # ─── Layer 4: Completion Agent ───
+    # ─── Layer 4: Completion Agent (verdict only — no Linear access) ───
     completion = run Completion Agent
+    # The Completion Agent returns a VERDICT, not a Linear action.
+    # It has LINEAR MCP RESTRICTION — it cannot post comments or change status.
+
     if completion.STATUS == "COMPLETE":
 
-        # ─── Layer 5: ORCHESTRATOR VERIFIES COMMENT EXISTS (HARD GATE) ───
-        # The Completion Agent CLAIMS it posted the comment. We do NOT trust claims.
-        # The orchestrator independently checks Linear, same philosophy as Layer 2.
-        WAIT 3 seconds  # Give Linear API time to propagate
+        # ─── Layer 5: ORCHESTRATOR ASSEMBLES & POSTS EVIDENCE (HARD GATE) ───
+        # No agent posts to Linear. The ORCHESTRATOR assembles raw proof from
+        # Task tool returns and posts it directly. This eliminates fabrication.
+        #
+        # The orchestrator already has these in memory from earlier layers:
+        #   - VERIFICATION_RAW_OUTPUT: raw terminal output from Verification Agent
+        #   - CODE_REVIEW_RAW_OUTPUT: raw output from Code Review Agent
+        #   - completion.REQUIREMENT_TABLE: structured table from Completion Agent
+        #   - WORKTREE_BRANCH, commit_hash: from Worker Agent result
 
-        linear_comments = ORCHESTRATOR fetches comments on {TICKET_ID} via Linear MCP
-        # This is the ORCHESTRATOR making the API call, NOT the Completion Agent.
-        # The agent's self-report is irrelevant — only the API response matters.
+        evidence_comment = assemble_evidence_comment(
+            ticket_id = {TICKET_ID},
+            ticket_title = {TICKET_TITLE},
+            branch = {WORKTREE_BRANCH},
+            commit = {commit_hash},
+            verification_raw = VERIFICATION_RAW_OUTPUT,   # raw terminal: build, lint, test output
+            code_review_raw = CODE_REVIEW_RAW_OUTPUT,      # raw review findings
+            requirement_table = completion.REQUIREMENT_TABLE,
+            files_changed = completion.FILES_CHANGED
+        )
 
-        evidence_comment = find comment containing "## Implementation Complete"
+        # Format:
+        # "## Implementation Complete ✓
+        #
+        # **Branch:** {WORKTREE_BRANCH}
+        # **Commit:** {commit_hash}
+        #
+        # ### Raw Verification Output (Terminal)
+        # ```
+        # {VERIFICATION_RAW_OUTPUT — first 2000 chars, truncated if longer}
+        # ```
+        #
+        # ### Code Review Summary
+        # {CODE_REVIEW_RAW_OUTPUT — first 1000 chars}
+        #
+        # ### Requirements Matched
+        # {completion.REQUIREMENT_TABLE}
+        #
+        # ### Files Changed
+        # {completion.FILES_CHANGED}"
 
-        if evidence_comment is NOT found:
-            LOG ERROR: "LAYER 5 HARD GATE FAILED: No evidence comment found on Linear for {TICKET_ID}"
-            LOG ERROR: "Completion Agent claimed COMPLETE but orchestrator cannot find the comment"
-            resume Completion Agent → "CRITICAL: The orchestrator independently checked Linear and your evidence comment is NOT THERE. The comment with '## Implementation Complete ✓' does not exist on the ticket. You MUST post it NOW using Linear MCP addComment. Do NOT claim you already posted it — the API shows it is missing."
-            loop_count += 1
-            last_error = { type: "missing_evidence_comment", message: "Completion Agent did not post evidence comment" }
-            consecutive_same_error = (last_error?.type == "missing_evidence_comment") ? consecutive_same_error + 1 : 1
-            update sprint-state.json
-            continue
+        # ORCHESTRATOR posts the comment directly via Linear MCP
+        post_result = ORCHESTRATOR calls Linear MCP createComment({TICKET_ID}, evidence_comment)
 
-        if evidence_comment missing "### Evidence" OR missing "### Requirements Matched":
-            LOG ERROR: "Evidence comment exists but is incomplete — missing required sections"
-            resume Completion Agent → "Evidence comment found but is INCOMPLETE. Required sections: '### Evidence' AND '### Requirements Matched'. Re-post the full comment."
-            loop_count += 1
-            update sprint-state.json
-            continue
+        if post_result FAILED:
+            LOG ERROR: "LAYER 5 HARD GATE FAILED: Could not post evidence comment to Linear"
+            LOG ERROR: "Linear API error: {post_result.error}"
+            # Retry once after 5 seconds
+            WAIT 5 seconds
+            post_result = ORCHESTRATOR retries Linear MCP createComment({TICKET_ID}, evidence_comment)
+            if post_result FAILED:
+                LOG ERROR: "LAYER 5 RETRY FAILED — flagging ticket for manual intervention"
+                last_error = { type: "linear_api_failure", message: "Cannot post evidence to Linear" }
+                ticket_state = "stuck"
+                update sprint-state.json: tickets[{TICKET_ID}].status = "stuck"
+                break
 
-        LOG: "Layer 5 PASSED: Evidence comment verified on Linear for {TICKET_ID}"
+        LOG: "Layer 5 PASSED: Evidence comment posted to Linear by ORCHESTRATOR for {TICKET_ID}"
 
-        # ─── Layer 5.5: ORCHESTRATOR VERIFIES TICKET STATUS (HARD GATE) ───
-        # Same principle: orchestrator checks status independently.
+        # ─── Layer 5.5: ORCHESTRATOR MARKS DONE & VERIFIES STATUS (HARD GATE) ───
+        # Orchestrator changes ticket status to Done directly.
+        ORCHESTRATOR calls Linear MCP updateIssue({TICKET_ID}, status: "Done")
+        WAIT 2 seconds  # Give Linear API time to propagate
+
+        # Verify the status actually changed
         ticket_status = ORCHESTRATOR fetches {TICKET_ID} status via Linear MCP
 
         if ticket_status != "Done":
             LOG ERROR: "LAYER 5.5 HARD GATE FAILED: Ticket {TICKET_ID} status is '{ticket_status}', not 'Done'"
-            resume Completion Agent → "CRITICAL: The orchestrator checked Linear and ticket status is '{ticket_status}', NOT 'Done'. Mark it Done NOW using Linear MCP."
-            loop_count += 1
-            last_error = { type: "ticket_not_done", message: "Status is {ticket_status}" }
-            update sprint-state.json
-            continue
+            # Retry once
+            ORCHESTRATOR calls Linear MCP updateIssue({TICKET_ID}, status: "Done")
+            WAIT 3 seconds
+            ticket_status = ORCHESTRATOR fetches {TICKET_ID} status via Linear MCP
+            if ticket_status != "Done":
+                LOG ERROR: "LAYER 5.5 RETRY FAILED — status still '{ticket_status}'"
+                last_error = { type: "ticket_not_done", message: "Cannot mark Done on Linear" }
+                ticket_state = "stuck"
+                update sprint-state.json: tickets[{TICKET_ID}].status = "stuck"
+                break
 
-        LOG: "Layer 5.5 PASSED: Ticket {TICKET_ID} confirmed 'Done' on Linear"
+        LOG: "Layer 5.5 PASSED: Ticket {TICKET_ID} marked 'Done' by ORCHESTRATOR on Linear"
 
         # ─── ALL INDEPENDENTLY VERIFIED — ticket is genuinely complete ───
         ticket_state = "complete"
         update sprint-state.json: tickets[{TICKET_ID}].status = "complete"
+        update sprint-state.json: tickets[{TICKET_ID}].evidence_posted_by = "orchestrator"
         update sprint-state.json: tickets[{TICKET_ID}].evidence_comment_verified = true
         update sprint-dashboard.md (if SPRINT_DASHBOARD enabled)
-        LOG: "TICKET {TICKET_ID} PROVEN COMPLETE — evidence comment ✓, status Done ✓"
+        LOG: "TICKET {TICKET_ID} PROVEN COMPLETE — orchestrator posted evidence ✓, status Done ✓"
         break
 
     else:
@@ -2223,7 +2261,7 @@ The orchestrator itself follows these principles:
 16. **Pass enriched ticket context to workers.** If the ticket description has Edge Cases, File Context, Contracts, or Test Patterns sections, paste them directly into the Worker Agent prompt. Workers should never guess at signatures.
 17. **Verify edge cases exist in tests.** Layer 2.5 in the verification loop checks that every edge case from the ticket description has a corresponding test case.
 18. **Run retrospective at sprint end.** Phase 8 is not optional. Learnings feed back to progress.txt, CLAUDE.md, and /tickets memory.
-19. **Never trust Completion Agent's claim about Linear.** The orchestrator MUST independently call Linear MCP to verify the evidence comment exists AND ticket status is "Done". The Completion Agent saying "I posted it" is NOT evidence, the API response showing the comment IS evidence. This is the same philosophy as Layer 2 not trusting Worker claims.
+19. **Only the orchestrator touches Linear.** No agent posts comments or changes ticket status. The orchestrator captures raw terminal output from Verification and Code Review agents via Task tool returns, assembles the evidence comment itself, posts it via Linear MCP, and marks the ticket Done. Raw terminal output IS proof. Agent-written summaries are NOT proof.
 20. **Agent Teams per ticket by default.** Deploy Context Agent + Worker Agent as teammates in a shared worktree. The orchestrator is team lead. The Worker should ASK the Context Agent for signatures and patterns instead of guessing. Only fall back to sequential subagents if the user explicitly chooses it or `CLAUDE_CODE_EXPERIMENTAL_AGENT_TEAMS` is not set.
 
 ---
@@ -2239,7 +2277,7 @@ The orchestrator itself follows these principles:
 | Verification Agent | Sonnet 4.6 | None — runs commands on worktree branch | `subagent_type: "general-purpose"` | 1+ per ticket | Independent verification + cross-check |
 | Code Review Agent | Sonnet 4.6 | None — reads worktree branch via git diff | `subagent_type: "general-purpose"` | 1+ per ticket | Security, logic, patterns |
 | Fix Agent | Opus 4.6 | `resume: "{worker_agent_id}"` (same worktree) | `subagent_type: "general-purpose"` | 0-N per ticket | Fix verification/review/human issues |
-| Completion Agent | Sonnet 4.6 | None — reads worktree branch | `subagent_type: "general-purpose"` | 1+ per ticket | Evidence-based requirement match |
+| Completion Agent | Sonnet 4.6 | None — reads worktree branch | `subagent_type: "general-purpose"` | 1+ per ticket | Requirement matching verdict only (no Linear access) |
 | Scheduler Agent | Sonnet 4.6 | None | `subagent_type: "general-purpose"` | 1 (global) | Conflict prediction + merge ordering |
 | Conflict Agent | Opus 4.6 | None — operates on main repo | `subagent_type: "general-purpose"` | 0-N (on conflict) | Resolve merges with intent context |
 | Build Gate Agent | Opus 4.6 | None — operates on main repo | `subagent_type: "general-purpose"` | 0-N (on failure) | Fix build failures (after bisection) |
@@ -2351,10 +2389,10 @@ echo "Cleanup complete."
     [ ] Layer 2.5: Edge case verification — every edge case from ticket has a test
     [ ] Layer 3: Code review passed (CRITICAL=0, HIGH=0)
     [ ] Layer 3.5: Human review completed (if HUMAN_IN_LOOP=true)
-    [ ] Layer 4: Completion agent matched all requirements with evidence
-    [ ] Layer 5: ORCHESTRATOR independently verified evidence comment exists on Linear (hard gate)
-    [ ] Layer 5: Evidence comment contains "### Evidence" AND "### Requirements Matched"
-    [ ] Layer 5.5: ORCHESTRATOR independently verified ticket status == "Done" on Linear (hard gate)
+    [ ] Layer 4: Completion agent returned COMPLETE verdict with requirement table (no Linear access)
+    [ ] Layer 5: ORCHESTRATOR assembled evidence from raw outputs and posted to Linear (hard gate)
+    [ ] Layer 5: Evidence comment contains raw terminal output + requirement table + files changed
+    [ ] Layer 5.5: ORCHESTRATOR marked ticket Done on Linear and verified status (hard gate)
     [ ] Zero evidence mismatches detected across all tickets
     [ ] Circuit breaker: No ticket exceeded 2x same-error (or escalated to fresh agent)
     [ ] sprint-state.json updated per ticket (loop_count, status, last_error if any)
