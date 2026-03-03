@@ -591,9 +591,12 @@ If `/tickets` was run before this sprint, it may have left hints:
 if [ -f .claude/sprint-hints.json ]; then
     echo "Sprint hints found from /tickets"
 
-    # Validate expected fields exist before reading
-    if ! jq -e '.plan_commit' .claude/sprint-hints.json >/dev/null 2>&1; then
-        echo "⚠️  sprint-hints.json is malformed (missing plan_commit). Ignoring."
+    # Validate ALL expected fields exist before reading
+    # Required fields: plan_commit, tickets (object), total_tickets, coordination_mode_recommendation
+    if ! jq -e '.plan_commit and .tickets and .total_tickets and .coordination_mode_recommendation' .claude/sprint-hints.json >/dev/null 2>&1; then
+        echo "⚠️  sprint-hints.json is malformed (missing required fields). Ignoring."
+        echo "    Required: plan_commit, tickets, total_tickets, coordination_mode_recommendation"
+        echo "    Found: $(jq -r 'keys | join(", ")' .claude/sprint-hints.json 2>/dev/null || echo 'unparseable')"
         SPRINT_HINTS_LOADED=false
     else
         # 1. Check for stale plan
@@ -2922,7 +2925,16 @@ git branch --list "worktree-*" | while read branch; do
   fi
 done
 
-# 4. Final status
+# 4. Archive sprint-state.json alongside the retrospective
+if [ -f .claude/sprint-state.json ]; then
+  sprint_id=$(jq -r '.sprint_id // "unknown"' .claude/sprint-state.json 2>/dev/null)
+  mkdir -p .claude/sprint-history
+  cp .claude/sprint-state.json ".claude/sprint-history/sprint-state-${sprint_id}.json"
+  echo "Archived sprint-state.json → .claude/sprint-history/sprint-state-${sprint_id}.json"
+  rm .claude/sprint-state.json
+fi
+
+# 5. Final status
 git worktree list
 echo "Cleanup complete."
 ```

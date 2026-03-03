@@ -203,6 +203,19 @@ If progress.txt exists at the repo root, read it FIRST and absorb the "Codebase 
 section. These are patterns discovered by prior sprint agents that may inform your analysis.
 If progress.txt does NOT exist (first sprint on this repo), skip this step — do not error.
 
+## Persistent Memory (from previous /tickets runs)
+Check .claude/agent-memory/tickets-explore/ for previous analysis of this codebase.
+If the directory doesn't exist or is empty, skip (first run on this repo).
+If previous analysis exists:
+  - Read it and use relevant findings to ACCELERATE your analysis
+  - But VERIFY findings are still current — files may have moved or changed
+  - Stale entries (referencing files that no longer exist) should be noted for pruning
+
+After completing your analysis, UPDATE your agent memory:
+  - Save to .claude/agent-memory/tickets-explore/
+  - Include: architecture patterns, test infrastructure, error handling conventions,
+    integration points, and any corrections to previous entries
+
 Analyze the codebase for implementing: "{FEATURE}"
 
 ## What to Map
