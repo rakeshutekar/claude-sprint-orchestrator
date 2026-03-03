@@ -198,6 +198,11 @@ You do NOT have permission to interact with Linear in ANY way.
 Do NOT read tickets, post comments, or change statuses.
 Your ONLY job is to analyze the codebase. The orchestrator handles all Linear interactions.
 
+## Accumulated Learnings (from progress.txt)
+If progress.txt exists at the repo root, read it FIRST and absorb the "Codebase Patterns"
+section. These are patterns discovered by prior sprint agents that may inform your analysis.
+If progress.txt does NOT exist (first sprint on this repo), skip this step — do not error.
+
 Analyze the codebase for implementing: "{FEATURE}"
 
 ## What to Map
@@ -383,6 +388,11 @@ model: "sonnet"
 You do NOT have permission to interact with Linear in ANY way.
 Do NOT read tickets, post comments, or change statuses.
 Your ONLY job is to analyze files. The orchestrator handles all Linear interactions.
+
+## Accumulated Learnings (from progress.txt)
+If progress.txt exists at the repo root, read it FIRST. The "Codebase Patterns" section
+contains patterns from prior sprints that may affect your analysis (e.g., import aliases,
+mock patterns, error handling conventions). If progress.txt does NOT exist, skip — do not error.
 
 You are analyzing files for a specific ticket. Read each file COMPLETELY
 and extract detailed implementation context.
