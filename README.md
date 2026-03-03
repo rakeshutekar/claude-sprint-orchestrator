@@ -56,7 +56,10 @@ The planning command. Given a feature description, it analyzes your codebase, ge
 ┌─────────────────────────────────────────┐
 │  PHASE 0: PRE-FLIGHT                    │
 │  ├── Check Linear MCP connection        │
-│  └── Verify git clean + pull base       │
+│  ├── Verify git clean + pull base       │
+│  ├── Verify baseline BUILD passes       │
+│  └── Init support files (progress.txt,  │
+│       agent-memory dir, .gitignore)     │
 └─────────────────────────────────────────┘
     │
     ▼
@@ -135,7 +138,10 @@ The planning command. Given a feature description, it analyzes your codebase, ge
 ┌─────────────────────────────────────────┐
 │  PHASE 5: SAVE & OUTPUT                 │
 │  ├── Save plan to .claude/plans/        │
-│  ├── Display sprint config              │
+│  ├── Tag codebase snapshot (staleness)  │
+│  ├── Display sprint config (all fields) │
+│  ├── Save sprint hints (.json)          │
+│  ├── Recommend coordination mode        │
 │  ├── Update Explore agent memory        │
 │  └── Offer to kick off /sprint          │
 └─────────────────────────────────────────┘
@@ -151,6 +157,12 @@ The planning command. Given a feature description, it analyzes your codebase, ge
 - **Rollback plans** — Auto-generated for schema/migration/integration tickets
 - **Persistent Explore memory** — Codebase knowledge accumulates across `/tickets` runs
 - **Anti-hallucination guardrails** — Every agent is required to show evidence with file paths and line numbers
+- **Baseline build verification** — Phase 0 verifies the base branch compiles before generating tickets
+- **Sprint hints** — Saves ticket metadata (.claude/sprint-hints.json) for /sprint to pre-populate state and detect stale plans
+- **Coordination mode recommendation** — Analyzes ticket complexity to recommend Agent Teams vs Subagents
+- **Codebase snapshot tagging** — Tags the exact commit the plan was generated against for staleness detection
+- **Partial creation rollback** — Tracks created ticket IDs for rollback if Linear API fails mid-creation
+- **LINEAR MCP RESTRICTION on all agents** — Only the orchestrator touches Linear; read-only agents are explicitly restricted
 
 ### Enriched Ticket Template
 
@@ -175,7 +187,7 @@ The execution command. Fetches tickets from Linear, deploys Agent Teams per tick
 
 ### What It Does
 
-1. **Pre-flight** — Validates Linear MCP, git state, baseline build. User chooses coordination mode (Agent Teams recommended, Subagents fallback). Initializes sprint-state.json checkpoints
+1. **Pre-flight** — Validates Linear MCP, git state, baseline build. Loads sprint hints from /tickets (if available) for stale plan detection. User chooses coordination mode (Agent Teams recommended, Subagents fallback). Initializes sprint-state.json checkpoints
 2. **Fetch tickets** — Queries Linear for matching tickets
 3. **Deploy Agent Teams** — Per ticket: orchestrator (team lead) spawns Context Agent (Sonnet) + Worker Agent (Opus) as teammates in a shared worktree. They communicate directly, the Worker asks follow-up questions, the Context Agent reads files on demand
 4. **Code simplifier** — Conditional refine pass (skipped in Agent Teams with clean code, for bug fixes, or small tickets). Auto-reverts if it breaks tests.

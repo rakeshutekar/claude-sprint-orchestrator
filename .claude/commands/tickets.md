@@ -117,7 +117,11 @@ LINT_CMD: "npm run lint"
 TEST_CMD: "npm run test:run"
 TYPECHECK_CMD: "npx tsc --noEmit"
 E2E_CMD: "npx playwright test"
+COMMIT_PREFIX: "feat"                   # Conventional commit prefix (feat, fix, refactor, etc.)
 MAX_LOOP_ITERATIONS: 3
+HUMAN_IN_LOOP: false                    # true = pause for human review before marking Done
+PARTIAL_MERGE: true                     # true = merge completed tickets even if some are stuck
+SPRINT_DASHBOARD: true                  # true = write sprint-dashboard.md after each phase
 ```
 
 If the user doesn't provide config, use the defaults above and ask only for FEATURE.
@@ -139,6 +143,40 @@ git checkout {BRANCH_BASE}
 git pull origin {BRANCH_BASE}
 ```
 
+### Step 0C: Verify Baseline Build
+```bash
+{BUILD_CMD}             # Must exit 0
+```
+If build fails → STOP. The base branch is broken. Fix it before planning tickets.
+Tickets generated against a broken codebase will reference stale/broken code —
+file context, function signatures, and type definitions cannot be trusted.
+
+### Step 0D: Initialize Support Files
+```bash
+# Ensure progress.txt exists (Ralph Pattern — shared memory for agents)
+if [ ! -f progress.txt ]; then
+  cat > progress.txt << 'EOF'
+# Sprint Progress
+
+## Codebase Patterns (read FIRST before starting any task)
+- (none yet — agents will add patterns as they discover them)
+
+## Completed Tickets
+(none yet)
+EOF
+fi
+
+# Ensure agent memory directory exists
+mkdir -p .claude/agent-memory/tickets-explore
+
+# Ensure .claude/worktrees/ is in .gitignore (for /sprint later)
+git check-ignore -q .claude/worktrees/ 2>/dev/null || echo ".claude/worktrees/" >> .gitignore
+
+# Ensure sprint dashboard and state files are gitignored
+git check-ignore -q .claude/sprint-dashboard.md 2>/dev/null || echo ".claude/sprint-dashboard.md" >> .gitignore
+git check-ignore -q .claude/sprint-state.json 2>/dev/null || echo ".claude/sprint-state.json" >> .gitignore
+```
+
 ---
 
 ## PHASE 1: CODEBASE ANALYSIS (Broad Sweep)
@@ -154,6 +192,11 @@ model: "sonnet"
 **Prompt:**
 ```
 {PASTE ANTI-HALLUCINATION RULES FROM GUARDRAILS SECTION ABOVE}
+
+## LINEAR MCP RESTRICTION
+You do NOT have permission to interact with Linear in ANY way.
+Do NOT read tickets, post comments, or change statuses.
+Your ONLY job is to analyze the codebase. The orchestrator handles all Linear interactions.
 
 Analyze the codebase for implementing: "{FEATURE}"
 
@@ -245,22 +288,25 @@ Generate the plan in this format:
 
 ## Phases
 
-### Phase 1: Foundation
+### Implementation Wave 1: Foundation
 {Database migrations, shared types, core services — things with no dependencies}
 
-### Phase 2: Core Features
-{Main implementation — services, components, hooks — depends on Phase 1}
+### Implementation Wave 2: Core Features
+{Main implementation — services, components, hooks — depends on Wave 1}
 
-### Phase 3: Integration
-{Wiring, layout changes, route updates — depends on Phase 2}
+### Implementation Wave 3: Integration
+{Wiring, layout changes, route updates — depends on Wave 2}
 
-### Phase 4: Polish
+### Implementation Wave 4: Polish
 {Refactoring, extraction, optimization — depends on everything}
+
+NOTE: These "Implementation Waves" describe the ticket execution order, NOT /sprint phases.
+/sprint has its own Phase 0-8 for the orchestration lifecycle.
 
 ## Tickets
 
 ### {TICKET_NUMBER}. {TICKET_TITLE}
-- **Phase:** {1|2|3|4}
+- **Wave:** {1|2|3|4} (Implementation Wave — NOT /sprint phase)
 - **Priority:** {1=urgent|2=high|3=medium|4=low}
 - **Depends on:** {list of ticket numbers, or "none"}
 - **Tags:** {migration|schema|integration|service|component|hook|config — for rollback detection}
@@ -297,7 +343,11 @@ LINT_CMD: "{LINT_CMD}"
 TEST_CMD: "{TEST_CMD}"
 TYPECHECK_CMD: "{TYPECHECK_CMD}"
 E2E_CMD: "{E2E_CMD}"
+COMMIT_PREFIX: "{COMMIT_PREFIX}"
 MAX_LOOP_ITERATIONS: {MAX_LOOP_ITERATIONS}
+HUMAN_IN_LOOP: {HUMAN_IN_LOOP}
+PARTIAL_MERGE: {PARTIAL_MERGE}
+SPRINT_DASHBOARD: {SPRINT_DASHBOARD}
 ```
 
 ---
@@ -328,6 +378,11 @@ model: "sonnet"
 **Context Agent Prompt:**
 ```
 {PASTE ANTI-HALLUCINATION RULES FROM GUARDRAILS SECTION ABOVE}
+
+## LINEAR MCP RESTRICTION
+You do NOT have permission to interact with Linear in ANY way.
+Do NOT read tickets, post comments, or change statuses.
+Your ONLY job is to analyze files. The orchestrator handles all Linear interactions.
 
 You are analyzing files for a specific ticket. Read each file COMPLETELY
 and extract detailed implementation context.
@@ -470,6 +525,10 @@ model: "sonnet"
 **Prompt:**
 ```
 {PASTE ANTI-HALLUCINATION RULES FROM GUARDRAILS SECTION ABOVE}
+
+## LINEAR MCP RESTRICTION
+You do NOT have permission to interact with Linear in ANY way.
+Your ONLY job is to validate dependencies. The orchestrator handles all Linear interactions.
 
 You are validating that ticket dependencies are correct.
 
@@ -774,6 +833,24 @@ Save the full plan to `.claude/plans/`:
 # Example: real-time-notifications-20260226.md
 ```
 
+### Step 5A.5: Tag Codebase Snapshot (Stale Risk Prevention)
+
+```bash
+# Tag the exact commit that the plan was generated against.
+# If /sprint runs later on a different commit, its stale base detection
+# can compare against this tag to know if file context has drifted.
+git tag tickets-plan-$(date +%Y%m%d-%H%M%S) {BRANCH_BASE}
+```
+
+Display a staleness warning in the output:
+```
+⚠️  STALENESS WARNING: This plan was generated against commit {SHORT_HASH} of {BRANCH_BASE}.
+If {BRANCH_BASE} has new commits before you run /sprint, the file context and function
+signatures in ticket descriptions may be stale. /sprint's stale base detection (Phase 3
+pre-check) will catch and rebase, but ticket descriptions won't auto-update.
+If significant changes landed, consider re-running /tickets.
+```
+
 ### Step 5B: Output Sprint Config
 
 Display the ready-to-paste `/sprint` config:
@@ -798,16 +875,78 @@ LINEAR_FILTER:
   team: "{LINEAR_TEAM}"
   label: "{LINEAR_SPRINT_LABEL}"
   status: ["Todo"]
+  # NOTE: If resuming a partially-completed sprint, change to: status: ["Todo", "In Progress"]
 PROJECT_STANDARDS: "{PROJECT_STANDARDS}"
 BUILD_CMD: "{BUILD_CMD}"
 LINT_CMD: "{LINT_CMD}"
 TEST_CMD: "{TEST_CMD}"
 TYPECHECK_CMD: "{TYPECHECK_CMD}"
 E2E_CMD: "{E2E_CMD}"
+COMMIT_PREFIX: "{COMMIT_PREFIX}"
 MAX_LOOP_ITERATIONS: {MAX_LOOP_ITERATIONS}
+HUMAN_IN_LOOP: {HUMAN_IN_LOOP}
+PARTIAL_MERGE: {PARTIAL_MERGE}
+SPRINT_DASHBOARD: {SPRINT_DASHBOARD}
 ```
 
-### Step 5C: Offer Auto-Sprint
+### Step 5B.5: Recommend Coordination Mode
+
+Based on the plan analysis, recommend a coordination mode for `/sprint`:
+
+```
+Analyze the ticket plan and recommend:
+
+IF any of these are true → recommend Agent Teams:
+  - More than 3 tickets have cross-ticket dependencies
+  - Any ticket has complexity L (after Phase 2.75C re-evaluation)
+  - More than 2 tickets modify the same files (high conflict risk)
+  - Total edge cases across all tickets > 30
+
+IF all of these are true → recommend Subagents (lower cost):
+  - All tickets are independent (no dependencies)
+  - All tickets are complexity S
+  - Total tickets <= 3
+  - Total edge cases < 15
+
+Display recommendation in the Sprint Config output:
+  ## Coordination Mode Recommendation
+  Recommended: {Agent Teams | Subagents}
+  Reason: {brief explanation based on plan characteristics}
+  Note: /sprint will ask you to confirm this choice at Phase 0G.
+```
+
+### Step 5C: Save Sprint Hints (for /sprint Phase 0 acceleration)
+
+Save ticket metadata that `/sprint` can use to pre-populate sprint-state.json:
+
+```bash
+cat > .claude/sprint-hints.json << 'HINTSEOF'
+{
+  "generated_at": "{ISO_TIMESTAMP}",
+  "plan_commit": "{BRANCH_BASE_COMMIT_HASH}",
+  "tickets": {
+    "{TICKET_ID}": {
+      "title": "{TICKET_TITLE}",
+      "complexity": "{S|M|L}",
+      "dependencies": ["{dep_ticket_ids}"],
+      "files_to_create": ["{file_paths}"],
+      "files_to_modify": ["{file_paths}"],
+      "edge_case_count": {N}
+    }
+  },
+  "coordination_mode_recommendation": "{agent-teams|subagents}",
+  "total_tickets": {N},
+  "total_edge_cases": {N}
+}
+HINTSEOF
+```
+
+If `/sprint` finds this file at Phase 0, it can:
+- Pre-populate sprint-state.json ticket entries
+- Use the recommended coordination mode as default
+- Detect stale plans by comparing `plan_commit` to current `{BRANCH_BASE}`
+
+### Step 5D: Offer Auto-Sprint
 
 ```
 Want me to kick off /sprint now with this config? (yes/no)
@@ -844,9 +983,14 @@ How it's used:
 
 To enable, the Explore agent prompt includes:
 ```
-Before starting: Check your agent memory for previous analysis of this codebase.
-Use any relevant findings to accelerate your analysis, but VERIFY they are still
-current (files may have moved or changed since last analysis).
+Before starting:
+1. Check if progress.txt exists at repo root. If it does, read the Codebase Patterns
+   section FIRST — these are learnings from previous sprints.
+   If it doesn't exist, skip (Phase 0D creates it, but may not have run yet).
+2. Check .claude/agent-memory/tickets-explore/ for previous analysis of this codebase.
+   If directory doesn't exist or is empty, skip (first run).
+   Use any relevant findings to accelerate your analysis, but VERIFY they are still
+   current (files may have moved or changed since last analysis).
 
 After completing: Update your agent memory with:
 - New architecture patterns discovered
@@ -854,11 +998,42 @@ After completing: Update your agent memory with:
 - Error handling conventions
 - Integration points mapped
 - Any corrections to previous memory entries
+Save to: .claude/agent-memory/tickets-explore/ (directory created by Phase 0D)
 ```
 
 ---
 
 ## ROLLBACK
+
+### Automatic Rollback (partial creation failure)
+
+If ticket creation fails mid-way through Phase 4 (e.g., Linear API error after
+creating 5 of 8 tickets), the orchestrator MUST:
+
+```
+1. Track created ticket IDs as they are created:
+   created_ticket_ids = []
+   for each ticket in plan:
+       result = create Linear issue(...)
+       if result SUCCESS:
+           created_ticket_ids.append(result.id)
+       if result FAILED:
+           LOG ERROR: "Failed to create ticket {ticket.title}: {error}"
+           # Offer rollback
+           if created_ticket_ids.length > 0:
+               ask user: "Created {created_ticket_ids.length} of {total} tickets before failure.
+                         Options:
+                         1. Keep created tickets and retry remaining
+                         2. Delete all created tickets and abort
+                         3. Keep created tickets and abort (partial plan)"
+               if user selects "delete all":
+                   for each id in created_ticket_ids:
+                       delete Linear issue(id)
+                   LOG: "Rolled back {created_ticket_ids.length} tickets"
+           break
+```
+
+### Manual Rollback (user-initiated)
 
 If something goes wrong after tickets are created on Linear:
 
@@ -896,14 +1071,26 @@ Or tell me: "delete the tickets you just created"
    the exact signatures and behaviors must be documented in the ticket.
 9. **Test patterns are mandatory.** Every ticket must include the project's test
    conventions so workers don't reinvent mocking/fixture patterns.
-10. **Anti-hallucination rules are injected into EVERY agent.** No exceptions.
-    Every Explore, Context, and Validation agent gets the full guardrails.
+10. **Anti-hallucination rules AND LINEAR MCP RESTRICTION are injected into EVERY agent.** No exceptions.
+    Every Explore, Context, and Validation agent gets both guardrails and the restriction.
+    Only the orchestrator itself touches Linear (Phase 4 ticket creation).
 11. **Always save the plan.** Even if user cancels Linear creation, save the .md.
-12. **Sprint config is always generated.** Even in dry-run mode.
+12. **Sprint config is always generated.** Even in dry-run mode. Must include ALL fields
+    that `/sprint` expects: COMMIT_PREFIX, HUMAN_IN_LOOP, PARTIAL_MERGE, SPRINT_DASHBOARD.
 13. **Rollback plans for schema/integration tickets.** Any ticket tagged
     migration, schema, or integration MUST have a rollback specification.
 14. **Two-pass research is not optional.** Phase 1 (broad) + Phase 2.5 (deep)
     must both run. Do NOT skip Phase 2.5 to save time.
+15. **Baseline build must pass.** Phase 0C verifies the base branch builds. Tickets
+    generated against a broken codebase have unreliable file context.
+16. **Tag the codebase snapshot.** Phase 5A.5 tags the exact commit the plan was
+    generated against. /sprint uses this to detect stale plans.
+17. **Save sprint hints.** Phase 5C writes .claude/sprint-hints.json for /sprint
+    to pre-populate state and detect plan staleness.
+18. **Track partial creation for rollback.** Phase 4 must track created ticket IDs
+    as they are created, so a mid-creation failure can be rolled back.
+19. **Recommend coordination mode.** Phase 5B.5 analyzes ticket complexity and
+    dependencies to recommend Agent Teams vs Subagents for /sprint.
 
 ---
 
@@ -916,7 +1103,10 @@ Or tell me: "delete the tickets you just created"
 ┌─────────────────────────────────────────┐
 │  PHASE 0: PRE-FLIGHT                    │
 │  ├── Check Linear MCP connection        │
-│  └── Verify git clean + pull base       │
+│  ├── Verify git clean + pull base       │
+│  ├── Verify baseline BUILD passes       │
+│  └── Init support files (progress.txt,  │
+│       agent-memory dir, .gitignore)     │
 └─────────────────────────────────────────┘
     │
     ▼
@@ -996,7 +1186,10 @@ Or tell me: "delete the tickets you just created"
 ┌─────────────────────────────────────────┐
 │  PHASE 5: SAVE & OUTPUT                 │
 │  ├── Save plan to .claude/plans/        │
-│  ├── Display sprint config              │
+│  ├── Tag codebase snapshot (staleness)  │
+│  ├── Display sprint config (all fields) │
+│  ├── Save sprint hints (.json)          │
+│  ├── Recommend coordination mode        │
 │  ├── Update Explore agent memory        │
 │  └── Offer to kick off /sprint          │
 └─────────────────────────────────────────┘
@@ -1022,7 +1215,10 @@ Or tell me: "delete the tickets you just created"
 Before presenting to user at Phase 3, verify:
 
 ```
-[ ] Phase 0: Linear MCP connected, git clean
+[ ] Phase 0: Linear MCP connected, git clean, baseline build passes
+[ ] Phase 0: progress.txt initialized (or already exists)
+[ ] Phase 0: .claude/agent-memory/tickets-explore/ directory created
+[ ] Phase 0: .gitignore includes worktrees, sprint-dashboard, sprint-state, sprint-hints
 [ ] Phase 1: ARCHITECTURE_REPORT has 0 UNVERIFIED references
 [ ] Phase 1: Test infrastructure documented (runner, mocking, fixtures)
 [ ] Phase 1: Error patterns documented with examples
@@ -1039,7 +1235,12 @@ Before presenting to user at Phase 3, verify:
 [ ] All tickets include Detailed File Context section
 [ ] All tickets include Caller-Callee Contracts section
 [ ] All tickets include Test Patterns section
-[ ] Sprint config generated
+[ ] Sprint config generated (includes COMMIT_PREFIX, HUMAN_IN_LOOP, PARTIAL_MERGE, SPRINT_DASHBOARD)
+[ ] Codebase snapshot tagged (tickets-plan-{timestamp})
+[ ] Staleness warning displayed
+[ ] Sprint hints saved (.claude/sprint-hints.json)
+[ ] Coordination mode recommendation provided
+[ ] Partial creation rollback tracking in place for Phase 4
 ```
 
 ---
@@ -1049,7 +1250,7 @@ Before presenting to user at Phase 3, verify:
 ```
 User: /tickets Add real-time notifications when compliance issues are detected
 
-Phase 0: Pre-flight ✓
+Phase 0: Pre-flight ✓ (Linear connected, git clean, build passes, support files initialized)
 
 Phase 1: Codebase analysis (Broad Explore agent)
   ├── Architecture: Next.js + Supabase + Zustand
@@ -1060,10 +1261,10 @@ Phase 1: Codebase analysis (Broad Explore agent)
   └── 0 unverified references ✓
 
 Phase 2: Generated plan:
-  8 tickets across 3 phases (edge cases + context = TBD)
-  ├── Phase 1: Migration + notification service (2 tickets, tagged: migration, service)
-  ├── Phase 2: Event hooks + queue + templates (4 tickets, tagged: service, hook)
-  └── Phase 3: UI components + settings page (2 tickets, tagged: component)
+  8 tickets across 3 waves (edge cases + context = TBD)
+  ├── Wave 1: Migration + notification service (2 tickets, tagged: migration, service)
+  ├── Wave 2: Event hooks + queue + templates (4 tickets, tagged: service, hook)
+  └── Wave 3: UI components + settings page (2 tickets, tagged: component)
 
 Phase 2.5: File-level context agents (4 parallel)
   ├── Context for CLA-40: migration — DB schema analyzed, rollback identified
@@ -1078,25 +1279,26 @@ Phase 2.75: Enrichment & validation
   ├── Dependencies: VALIDATED — 1 missing dep found and added ✓
   ├── Complexity: CLA-41 re-evaluated M→L, split into CLA-41a + CLA-41b
   ├── Rollback: CLA-40 has rollback plan (DROP COLUMN, no data loss) ✓
-  └── Now 9 tickets across 3 phases
+  └── Now 9 tickets across 3 waves
 
 Phase 3: Approval?
   Summary: 9 tickets, 47 edge cases, all deps validated, 1 rollback plan
 User: "yes"
 
 Phase 4: Created on Linear:
-  CLA-40: Create notifications table migration (P2, Phase 1, rollback: ✓)
-  CLA-41a: Implement notificationService core (P2, Phase 1, 6 edge cases)
-  CLA-41b: Implement notificationService delivery (P2, Phase 1, 5 edge cases)
-  CLA-42: Add issue detection event hook (P2, Phase 2, blocked by CLA-41a)
-  CLA-43: Create notification queue with retry (P3, Phase 2, blocked by CLA-41a)
-  CLA-44: Build notification templates (P3, Phase 2, blocked by CLA-41b)
-  CLA-45: Add Supabase real-time subscription (P2, Phase 2, blocked by CLA-40)
-  CLA-46: Create NotificationBell component (P2, Phase 3, blocked by CLA-45)
-  CLA-47: Add notification preferences page (P3, Phase 3, blocked by CLA-41a)
+  CLA-40: Create notifications table migration (P2, Wave 1, rollback: ✓)
+  CLA-41a: Implement notificationService core (P2, Wave 1, 6 edge cases)
+  CLA-41b: Implement notificationService delivery (P2, Wave 1, 5 edge cases)
+  CLA-42: Add issue detection event hook (P2, Wave 2, blocked by CLA-41a)
+  CLA-43: Create notification queue with retry (P3, Wave 2, blocked by CLA-41a)
+  CLA-44: Build notification templates (P3, Wave 2, blocked by CLA-41b)
+  CLA-45: Add Supabase real-time subscription (P2, Wave 2, blocked by CLA-40)
+  CLA-46: Create NotificationBell component (P2, Wave 3, blocked by CLA-45)
+  CLA-47: Add notification preferences page (P3, Wave 3, blocked by CLA-41a)
 
 Phase 5: Plan saved to .claude/plans/real-time-notifications-20260302.md
-  Explore agent memory updated with new architecture findings.
+  Codebase snapshot tagged. Sprint hints saved. Explore agent memory updated.
+  Coordination mode recommendation: Agent Teams (3+ cross-dependencies, 47 edge cases)
 
 Sprint config ready. Run /sprint to execute.
 ```

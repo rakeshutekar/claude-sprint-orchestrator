@@ -136,7 +136,7 @@ echo ".claude/worktrees/" >> .gitignore && git add .gitignore && git commit -m "
 │  │                                                          │    │
 │  │  ┌─────────────────┐  ◄── messages ──►  ┌────────────┐  │    │
 │  │  │  CONTEXT AGENT   │   (real-time)      │  WORKER    │  │    │
-│  │  │  (Sonnet 4.6)   │   direct comms      │  (Opus 4.6)│  │    │
+│  │  │  (Sonnet)   │   direct comms      │  (Opus)│  │    │
 │  │  │                 │                     │            │  │    │
 │  │  │  • Read codebase │  W: "signature?"   │  • Implement│  │    │
 │  │  │  • Map patterns  │  C: "fn(x:T):R"   │  • Write tests│ │    │
@@ -172,7 +172,7 @@ echo ".claude/worktrees/" >> .gitignore && git add .gitignore && git commit -m "
 │       MISSING/MISMATCH → resume Worker → fix                  │    │
 │       OK ↓                                                     │    │
 │                                                                │    │
-│  Layer 2: VERIFICATION AGENT (Sonnet 4.6) — MECHANICAL        │    │
+│  Layer 2: VERIFICATION AGENT (Sonnet) — MECHANICAL        │    │
 │  └── Runs build+lint+typecheck+tests, checks EXIT CODES       │    │
 │  └── Asserts test_count > 0 (silent success = FAIL)           │    │
 │  └── Validates config (no skipLibCheck, no hidden permissive)  │    │
@@ -188,7 +188,7 @@ echo ".claude/worktrees/" >> .gitignore && git add .gitignore && git commit -m "
 │  ⚡ CIRCUIT BREAKER: same error 2x → fresh agent     │    │    │
 │     fresh agent also fails → flag STUCK              │    │    │
 │                                                      │    │    │
-│  Layer 3: CODE REVIEW AGENT (Sonnet 4.6)             │    │    │
+│  Layer 3: CODE REVIEW AGENT (Sonnet)             │    │    │
 │  └── Security, logic, patterns, edge cases ──────┐   │    │    │
 │       CRITICAL/HIGH → resume Worker          │   │    │    │
 │       PASS ↓                                 │   │    │    │
@@ -198,7 +198,7 @@ echo ".claude/worktrees/" >> .gitignore && git add .gitignore && git commit -m "
 │       Changes requested → resume Worker│  │   │    │    │
 │       Approved ↓                       │  │   │    │    │
 │                                        │  │   │    │    │
-│  Layer 4: COMPLETION AGENT (Sonnet 4.6)│  │   │    │    │
+│  Layer 4: COMPLETION AGENT (Sonnet)│  │   │    │    │
 │  └── Verdict only (no Linear access)──┤  │   │    │    │
 │       INCOMPLETE → resume Worker   │  │   │    │    │
 │       COMPLETE ↓                   │  │   │    │    │
@@ -219,7 +219,7 @@ echo ".claude/worktrees/" >> .gitignore && git add .gitignore && git commit -m "
 │       ALL VERIFIED ↓               │  │   │    │    │
 │       ┌────────────────────┐  ┌────┴──┴───┴────┴──┐ │
 │       │ TICKET PROVEN DONE │  │  FIX AGENT        │ │
-│       │ Raw proof on Linear│  │  (Opus 4.6)       │ │
+│       │ Raw proof on Linear│  │  (Opus)       │ │
 │       └────────┬───────────┘  │  resume: worker_id│ │
 │                │              └───────────────────┘  │
 │                │ done                                 │
@@ -233,13 +233,13 @@ echo ".claude/worktrees/" >> .gitignore && git add .gitignore && git commit -m "
 │                                                                     │
 │  ┌──────────────────┐                                               │
 │  │  SCHEDULER AGENT  │  Predicts conflicts + orders merges          │
-│  │  (Sonnet 4.6)     │  Creates merge plan + conflict context       │
+│  │  (Sonnet)     │  Creates merge plan + conflict context       │
 │  └────────┬─────────┘                                               │
 │           │                                                         │
 │           ▼                                                         │
 │  ┌──────────────────┐    conflict?    ┌───────────────────┐         │
 │  │  MERGE EXECUTOR   │──────────────▶│  CONFLICT AGENT   │         │
-│  │  (sequential)     │               │  (Opus 4.6)       │         │
+│  │  (sequential)     │               │  (Opus)       │         │
 │  │                   │◀──────────────│  + Intent context  │         │
 │  │  Per branch:      │   resolved     │  + Edge cases both│         │
 │  │  • Merge          │    ↓           │  + Post-resolve   │         │
@@ -458,23 +458,32 @@ git tag sprint-start-$(date +%Y%m%d-%H%M%S) {BRANCH_BASE}
 ```
 This tag allows full rollback if the sprint goes wrong: `git reset --hard sprint-start-*`
 
-### Step 0E: Verify Worktree Isolation (CRITICAL)
+### Step 0E: Verify Worktree Isolation & Gitignore (CRITICAL)
 ```bash
 # 1. Check if .claude/worktrees/ is in .gitignore
 git check-ignore -q .claude/worktrees/ 2>/dev/null
 if [ $? -ne 0 ]; then
   echo ".claude/worktrees/" >> .gitignore
-  git add .gitignore
-  git commit -m "chore: add .claude/worktrees/ to .gitignore"
 fi
 
-# 2. Clean up any stale worktrees from previous sprints
+# 2. Ensure sprint runtime files are gitignored (they're live files, not code)
+git check-ignore -q .claude/sprint-dashboard.md 2>/dev/null || echo ".claude/sprint-dashboard.md" >> .gitignore
+git check-ignore -q .claude/sprint-state.json 2>/dev/null || echo ".claude/sprint-state.json" >> .gitignore
+git check-ignore -q .claude/sprint-hints.json 2>/dev/null || echo ".claude/sprint-hints.json" >> .gitignore
+
+# 3. Commit gitignore changes if any
+if ! git diff --quiet .gitignore 2>/dev/null; then
+  git add .gitignore
+  git commit -m "chore: gitignore sprint runtime files and worktrees"
+fi
+
+# 4. Clean up any stale worktrees from previous sprints
 git worktree list | grep -v "bare\|$(git rev-parse --show-toplevel)$" | while read path rest; do
   echo "Stale worktree found: $path"
 done
 # If stale worktrees exist, ask user: "Remove stale worktrees from previous sprint? (y/n)"
 
-# 3. Verify the directory exists (or will be created by Claude Code)
+# 5. Verify the directory exists (or will be created by Claude Code)
 mkdir -p .claude/worktrees
 ```
 
@@ -553,6 +562,30 @@ If user selects Agent Teams, verify the experimental flag is set:
 # Check if agent teams are enabled
 grep -q "CLAUDE_CODE_EXPERIMENTAL_AGENT_TEAMS" .claude/settings.json 2>/dev/null
 # If not found → warn user and fall back to subagents
+```
+
+### Step 0G.5: Load Sprint Hints (from /tickets)
+
+If `/tickets` was run before this sprint, it may have left hints:
+
+```bash
+if [ -f .claude/sprint-hints.json ]; then
+    echo "Sprint hints found from /tickets"
+    # 1. Check for stale plan
+    plan_commit=$(jq -r '.plan_commit' .claude/sprint-hints.json)
+    current_commit=$(git rev-parse {BRANCH_BASE})
+    if [ "$plan_commit" != "$current_commit" ]; then
+        echo "⚠️  STALE PLAN: /tickets ran at $plan_commit, base is now $current_commit"
+        echo "    Ticket file context may be outdated. Consider re-running /tickets."
+    fi
+
+    # 2. Use recommended coordination mode as default (user still confirms at Step 0G)
+    recommended_mode=$(jq -r '.coordination_mode_recommendation' .claude/sprint-hints.json)
+    echo "Recommended coordination mode from /tickets: $recommended_mode"
+
+    # 3. Pre-load ticket metadata for sprint-state initialization (Step 0H)
+    SPRINT_HINTS_LOADED=true
+fi
 ```
 
 ### Step 0H: Initialize Sprint State (Checkpoint System)
@@ -812,8 +845,8 @@ You are the WORKER AGENT implementing ticket {TICKET_ID}: "{TICKET_TITLE}".
 {TICKET_DESCRIPTION}
 
 ## Edge Cases from Ticket (IMPLEMENT ALL — no skipping)
-{IF TICKET_DESCRIPTION contains "## Edge Cases":
-  PASTE the entire Edge Cases section.
+{IF TICKET_DESCRIPTION contains a heading matching /^##\s*Edge Cases/i (case-insensitive, prefix match):
+  PASTE the entire Edge Cases section (from the heading to the next ## heading or end).
   These are MANDATORY acceptance criteria — you MUST write tests for ALL of them.
   Skipping an edge case is a RULE 4 violation (Zero Tolerance for Fake Work).
 }
@@ -821,24 +854,28 @@ You are the WORKER AGENT implementing ticket {TICKET_ID}: "{TICKET_TITLE}".
   test null/undefined, empty arrays, boundary values for every new function."}
 
 ## Detailed File Context from Ticket (DO NOT guess signatures — use these)
-{IF TICKET_DESCRIPTION contains "## Detailed File Context":
+{IF TICKET_DESCRIPTION contains a heading matching /^##\s*Detailed File Context/i:
   PASTE the entire Detailed File Context section.
   These are the EXACT function signatures, types, and error patterns for the files
   you'll modify. Use them. Do NOT guess at function signatures.
 }
 
 ## Caller-Callee Contracts (match these EXACTLY)
-{IF TICKET_DESCRIPTION contains "## Caller-Callee Contracts":
+{IF TICKET_DESCRIPTION contains a heading matching /^##\s*Caller.?Callee Contracts/i:
   PASTE the entire section.
   If your new code calls existing functions, use EXACTLY the signatures listed here.
   Wrong argument types or missing parameters = build failure.
 }
 
 ## Test Patterns (follow THESE conventions — not your own)
-{IF TICKET_DESCRIPTION contains "## Test Patterns":
+{IF TICKET_DESCRIPTION contains a heading matching /^##\s*Test Patterns/i:
   PASTE the entire section.
   Use the same test runner, assertion style, mocking patterns, and fixtures
   documented here. Do NOT introduce new patterns.
+
+HEADING MATCHING RULE: When extracting sections from ticket descriptions, use
+case-insensitive prefix matching on ## headings. The heading "## Edge Cases (MANDATORY)"
+should match the pattern for "Edge Cases". Never require exact string equality.
 }
 
 ## Context Agent Teammate (Agent Teams Mode)
@@ -1291,10 +1328,10 @@ This is a multi-layer system that catches errors at every level, not just at cod
 │  Reads diff, checks patterns, security, types                  │
 │  If CRITICAL/HIGH issues → Fix Agent                            │
 ├─────────────────────────────────────────────────────────────────┤
-│  LAYER 4: COMPLETION AGENT (requirements + evidence + Linear)  │
+│  LAYER 4: COMPLETION AGENT (verdict only — no Linear access)   │
 │  Matches code to ticket requirements line-by-line               │
-│  Attaches evidence to Linear ticket                             │
-│  Marks Done ONLY with proof                                     │
+│  Returns COMPLETE/INCOMPLETE verdict to orchestrator            │
+│  Orchestrator assembles raw proof and posts to Linear           │
 └─────────────────────────────────────────────────────────────────┘
 ```
 
@@ -1720,11 +1757,25 @@ while loop_count < MAX_LOOPS:
 
     # ─── Layer 2.5: Edge Case Verification (NEW) ───
     # Verify that edge cases from the ticket description have corresponding tests
-    if ticket_description contains "## Edge Cases":
+    if ticket_description contains heading matching /^##\s*Edge Cases/i:
         edge_cases = parse edge cases from ticket description
+        # PARSING RULE: Each edge case follows the format:
+        #   - [ ] `{function}`: {input condition} → expected: {specific behavior}
+        # Extract: function_name and a keyword from the input_condition
         for each edge_case in edge_cases:
-            grep test files in worktree branch for test matching edge_case.description
-            if no matching test found:
+            function_name = edge_case.function  # e.g., "createUser"
+            condition_keyword = extract primary noun/verb from edge_case.input_condition
+            # e.g., "empty string" → "empty", "null userId" → "null"
+
+            # Search strategy: grep test files for BOTH the function name AND condition keyword
+            # within the same test case (describe/it block)
+            test_files = git diff --name-only {BRANCH_BASE}..{WORKTREE_BRANCH} | grep -E '\.(test|spec)\.(ts|tsx|js|jsx)$'
+            match = grep -l "{function_name}" test_files | xargs grep -l "{condition_keyword}"
+
+            if no match found:
+                # Fallback: check if test description mentions the edge case
+                match = grep -rl "it\(.*{condition_keyword}" test_files
+            if still no match:
                 missing_edge_cases.append(edge_case)
 
         if missing_edge_cases is not empty:
@@ -2432,22 +2483,30 @@ Output E2E_RESULT with:
     ]
   - integration_issues: [{description, file, severity}]
 
+## LINEAR MCP RESTRICTION (CRITICAL)
+- You do NOT have permission to interact with Linear in ANY way.
+- Do NOT create tickets, post comments, or change statuses.
+- Report failures back to the orchestrator. It will create Linear tickets.
+
 ## On Failure
 If ANY test fails OR behavioral check fails:
-1. Create a NEW Linear ticket:
-   - Team: {LINEAR_FILTER.team}
-   - Title: "Fix: {description of what failed}"
-   - Priority: 2 (High)
-   - Label: {LINEAR_FILTER.label} (so the loop picks it up)
-   - Description: Include:
-     • What failed (exact error message or curl output)
-     • Expected behavior
-     • Actual behavior (with evidence)
-     • File paths involved
-     • Steps to reproduce
-     • Suggested fix approach
-2. Add a learning to progress.txt:
+1. DO NOT create Linear tickets yourself. Return failures in E2E_RESULT.
+2. Include in your failure report:
+   - What failed (exact error message or curl output)
+   - Expected behavior
+   - Actual behavior (with evidence)
+   - File paths involved
+   - Steps to reproduce
+   - Suggested fix approach
+3. Add a learning to progress.txt:
    "E2E: {what broke and why}"
+
+The ORCHESTRATOR will create Linear tickets for each E2E failure using:
+  - Team: {LINEAR_FILTER.team}
+  - Title: "Fix: {description from E2E_RESULT.failure}"
+  - Priority: 2 (High)
+  - Label: {LINEAR_FILTER.label}
+  - Description: {assembled from E2E_RESULT failure details}
 
 ## On Success
 Output: E2E_PASS for ticket {TICKET_ID} — with evidence summary.
@@ -2693,19 +2752,19 @@ The orchestrator itself follows these principles:
 
 | Agent | Model | Worktree | Mode | Count | Purpose |
 |-------|-------|----------|------|-------|---------|
-| Context Agent | Sonnet 4.6 | Shared worktree (teammate, read-only) | Agent Teams (default) | 1 per ticket | Codebase research + live follow-up answers |
-| Worker Agent | Opus 4.6 | Shared worktree (teammate, commits) | Agent Teams (default) | 1 per ticket | Implementation + edge cases + evidence |
-| Fresh Worker Agent | Opus 4.6 | `isolation: "worktree"` (new) | Both modes | 0-1 per ticket | Circuit breaker escalation, clean context |
-| Code Simplifier | Opus 4.6 | `resume: "{worker_agent_id}"` (same worktree) | `subagent_type: "code-simplifier:code-simplifier"` | 1 per ticket | Refine code clarity, non-blocking |
-| Verification Agent | Sonnet 4.6 | None — runs commands on worktree branch | `subagent_type: "general-purpose"` | 1+ per ticket | Independent verification + cross-check |
-| Code Review Agent | Sonnet 4.6 | None — reads worktree branch via git diff | `subagent_type: "general-purpose"` | 1+ per ticket | Security, logic, patterns |
-| Fix Agent | Opus 4.6 | `resume: "{worker_agent_id}"` (same worktree) | `subagent_type: "general-purpose"` | 0-N per ticket | Fix verification/review/human issues |
-| Completion Agent | Sonnet 4.6 | None — reads worktree branch | `subagent_type: "general-purpose"` | 1+ per ticket | Requirement matching verdict only (no Linear access) |
-| Scheduler Agent | Sonnet 4.6 | None | `subagent_type: "general-purpose"` | 1 (global) | Conflict prediction + merge ordering |
-| Conflict Agent | Opus 4.6 | None — operates on main repo | `subagent_type: "general-purpose"` | 0-N (on conflict) | Resolve merges with intent context |
-| Build Gate Agent | Opus 4.6 | None — operates on main repo | `subagent_type: "general-purpose"` | 0-N (on failure) | Fix build failures (after bisection) |
-| E2E Test Agent | Sonnet 4.6 | None — tests merged code | `subagent_type: "general-purpose"` | 1 per ticket | Behavioral verification |
-| Retrospective Agent | Sonnet 4.6 | None | `subagent_type: "general-purpose"` | 1 (global) | Post-sprint analysis + learning extraction |
+| Context Agent | Sonnet | Shared worktree (teammate, read-only) | Agent Teams (default) | 1 per ticket | Codebase research + live follow-up answers |
+| Worker Agent | Opus | Shared worktree (teammate, commits) | Agent Teams (default) | 1 per ticket | Implementation + edge cases + evidence |
+| Fresh Worker Agent | Opus | `isolation: "worktree"` (new) | Both modes | 0-1 per ticket | Circuit breaker escalation, clean context |
+| Code Simplifier | Opus | `resume: "{worker_agent_id}"` (same worktree) | `subagent_type: "code-simplifier:code-simplifier"` | 1 per ticket | Refine code clarity, non-blocking |
+| Verification Agent | Sonnet | None — runs commands on worktree branch | `subagent_type: "general-purpose"` | 1+ per ticket | Independent verification + cross-check |
+| Code Review Agent | Sonnet | None — reads worktree branch via git diff | `subagent_type: "general-purpose"` | 1+ per ticket | Security, logic, patterns |
+| Fix Agent | Opus | `resume: "{worker_agent_id}"` (same worktree) | `subagent_type: "general-purpose"` | 0-N per ticket | Fix verification/review/human issues |
+| Completion Agent | Sonnet | None — reads worktree branch | `subagent_type: "general-purpose"` | 1+ per ticket | Requirement matching verdict only (no Linear access) |
+| Scheduler Agent | Sonnet | None | `subagent_type: "general-purpose"` | 1 (global) | Conflict prediction + merge ordering |
+| Conflict Agent | Opus | None — operates on main repo | `subagent_type: "general-purpose"` | 0-N (on conflict) | Resolve merges with intent context |
+| Build Gate Agent | Opus | None — operates on main repo | `subagent_type: "general-purpose"` | 0-N (on failure) | Fix build failures (after bisection) |
+| E2E Test Agent | Sonnet | None — tests merged code | `subagent_type: "general-purpose"` | 1 per ticket | Behavioral verification |
+| Retrospective Agent | Sonnet | None | `subagent_type: "general-purpose"` | 1 (global) | Post-sprint analysis + learning extraction |
 
 **All agents receive ANTI-HALLUCINATION RULES in their prompt. No exceptions.**
 **Workers receive enriched ticket context (edge cases, file context, contracts, test patterns).**
