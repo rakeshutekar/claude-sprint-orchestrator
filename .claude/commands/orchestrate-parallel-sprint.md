@@ -740,6 +740,23 @@ When you receive a question:
 - If the Worker asks about something you haven't read, go READ IT then answer.
 - Do NOT guess at function signatures or type definitions.
 
+## CONTEXT EXHAUSTION SELF-MONITORING (CRITICAL)
+If you notice ANY of these symptoms in yourself, TELL THE WORKER IMMEDIATELY:
+- You are answering from memory instead of reading the actual file
+- You feel uncertain about a function signature but provide it anyway
+- You are paraphrasing code instead of quoting it exactly
+- You catch yourself saying "I believe..." or "I think..." instead of citing a file
+- Your response to a question does NOT include a file path + line number
+
+If any of the above happen, respond with:
+  "⚠️ CONTEXT EXHAUSTION WARNING: I may be degrading. I answered this from memory,
+   not from reading the file. VERIFY my answer by reading {file_path} yourself
+   before using this signature/pattern."
+
+This is NOT a failure — it's an honest signal that helps the Worker avoid hallucinated answers.
+A wrong signature from you causes a build failure that burns a loop iteration.
+An honest warning costs nothing.
+
 ## LINEAR MCP RESTRICTION (CRITICAL)
 - You do NOT have permission to interact with Linear in ANY way.
 - Do NOT change ticket status. Do NOT post comments. Do NOT mark tickets Done.
@@ -835,6 +852,25 @@ You are the WORKER AGENT implementing ticket {TICKET_ID}: "{TICKET_TITLE}".
   The Context Agent will READ the actual file and respond with evidence.
   USE THIS instead of guessing at signatures or patterns.
   DO NOT fabricate function signatures when you can just ASK.
+
+  ## TRUST-BUT-VERIFY RULE (Context Agent Exhaustion Protection)
+  The Context Agent may hit context limits on complex tickets. If it does, its
+  answers could degrade (answering from memory instead of reading files).
+
+  WATCH FOR these signals from the Context Agent:
+  - "⚠️ CONTEXT EXHAUSTION WARNING" — the Context Agent is self-reporting degradation
+  - Answers that lack file paths or line numbers
+  - Answers that say "I believe..." or "I think..." without file evidence
+  - Answers that seem inconsistent with what you've seen in the codebase
+
+  IF you see any of these signals:
+  1. DO NOT use the signature/pattern the Context Agent gave you
+  2. READ THE FILE YOURSELF: open the file and verify the signature/pattern
+  3. If the Context Agent is consistently degrading, STOP ASKING IT and read files directly
+  4. Note in your WORKER_RESULT: "Context Agent showed exhaustion signs — switched to direct file reads"
+
+  A wrong signature from the Context Agent → build failure → wasted loop iteration.
+  30 seconds reading a file yourself is cheaper than re-running the verification loop.
 }
 {IF COORDINATION_MODE == "subagents":
   ## Codebase Context (from Context Agent)
@@ -1858,7 +1894,7 @@ if context_usage > 70%:
     # Compaction will happen naturally; sprint-state.json survives it
 ```
 
-### Compaction Recovery Protocol
+### Compaction Recovery Protocol (with Rollback Safety)
 
 If the orchestrator detects it has been through a compaction event (context feels
 thin, sprint-state.json exists but ticket data isn't in memory):
@@ -1866,14 +1902,89 @@ thin, sprint-state.json exists but ticket data isn't in memory):
 ```
 1. Read .claude/sprint-state.json
 2. Read progress.txt for accumulated learnings
-3. For each ticket in sprint-state.json:
-   - If status == "complete": skip (already done)
-   - If status == "stuck": skip (flagged for manual)
-   - If status == "in_progress": resume from last known phase
-     - If has agent_id: try to resume that agent
-     - If no agent_id: re-run from Phase 2 for this ticket
-4. Continue sprint from the current phase
+
+3. ROLLBACK SAFETY: Reconcile sprint-state against actual Linear state.
+   The crash could have happened between any two operations. Trust NEITHER
+   sprint-state.json NOR agent memory — verify everything against Linear.
+
+   for each ticket in sprint-state.json:
+
+     # ─── CASE A: sprint-state says "complete" ───
+     if status == "complete":
+         # Verify it's ACTUALLY complete on Linear
+         linear_status = ORCHESTRATOR fetches {TICKET_ID} status via Linear MCP
+         linear_comments = ORCHESTRATOR fetches comments on {TICKET_ID} via Linear MCP
+         evidence_comment = find comment containing "## Implementation Complete"
+
+         if linear_status == "Done" AND evidence_comment EXISTS:
+             LOG: "VERIFIED: {TICKET_ID} confirmed complete on Linear"
+             skip  # genuinely complete
+
+         elif linear_status == "Done" AND evidence_comment MISSING:
+             LOG WARNING: "INCONSISTENT: {TICKET_ID} is Done on Linear but evidence comment is MISSING"
+             # Crash happened after marking Done but before/instead of posting comment
+             # Re-assemble evidence from worktree branch and post it
+             WORKTREE_BRANCH = sprint-state.tickets[TICKET_ID].branch
+             if WORKTREE_BRANCH exists:
+                 # Re-run Verification Agent to capture fresh raw output
+                 re_run Verification Agent → capture VERIFICATION_RAW_OUTPUT
+                 re_run Code Review Agent → capture CODE_REVIEW_RAW_OUTPUT
+                 re_run Completion Agent → capture requirement table
+                 ORCHESTRATOR assembles and posts evidence comment
+                 LOG: "REPAIRED: Evidence comment posted for {TICKET_ID}"
+             else:
+                 LOG ERROR: "Cannot repair {TICKET_ID} — worktree branch gone. Manual check needed."
+                 add Linear comment: "## Recovery Note\nSprint crashed. Ticket marked Done but evidence comment may be missing. Manual verification recommended."
+
+         elif linear_status != "Done" AND evidence_comment EXISTS:
+             LOG WARNING: "INCONSISTENT: {TICKET_ID} has evidence comment but status is '{linear_status}'"
+             # Crash happened after posting comment but before marking Done
+             ORCHESTRATOR calls Linear MCP updateIssue({TICKET_ID}, status: "Done")
+             LOG: "REPAIRED: Marked {TICKET_ID} Done on Linear"
+
+         elif linear_status != "Done" AND evidence_comment MISSING:
+             LOG ERROR: "STALE STATE: {TICKET_ID} says complete but Linear shows neither comment nor Done"
+             # sprint-state was updated prematurely, or crash happened during Layer 5
+             # Treat as in_progress — re-enter verification loop
+             update sprint-state.json: tickets[{TICKET_ID}].status = "in_progress"
+             update sprint-state.json: tickets[{TICKET_ID}].recovery = "re_verify"
+             # Fall through to Case C
+
+     # ─── CASE B: sprint-state says "stuck" ───
+     elif status == "stuck":
+         LOG: "STUCK: {TICKET_ID} — skipping (flagged for manual)"
+         skip
+
+     # ─── CASE C: sprint-state says "in_progress" ───
+     elif status == "in_progress":
+         # Check if it's further along than sprint-state thinks
+         linear_status = ORCHESTRATOR fetches {TICKET_ID} status via Linear MCP
+         if linear_status == "Done":
+             LOG WARNING: "AHEAD OF STATE: {TICKET_ID} is Done on Linear but sprint-state says in_progress"
+             # An agent may have marked it Done directly (violating rules), or crash
+             # happened after Layer 5.5 but before sprint-state update
+             # Verify evidence comment exists
+             evidence_comment = find comment containing "## Implementation Complete"
+             if evidence_comment EXISTS:
+                 update sprint-state.json: tickets[{TICKET_ID}].status = "complete"
+                 LOG: "REPAIRED: {TICKET_ID} promoted to complete"
+                 skip
+             else:
+                 LOG WARNING: "Done on Linear but no evidence — re-entering verification"
+                 # Fall through to resume
+
+         # Resume from last known phase
+         if has agent_id: try to resume that agent
+         if no agent_id: re-run from Phase 2 for this ticket
+
+4. LOG: "Recovery reconciliation complete. Resuming sprint."
+5. Continue sprint from the current phase
 ```
+
+**Why this matters:** The crash window between "post comment" → "mark Done" → "update sprint-state"
+is the most dangerous. Without reconciliation, you get phantom completes (sprint-state says done,
+Linear disagrees) or orphaned evidence (comment posted, ticket not marked Done). This protocol
+detects and repairs all four possible inconsistent states.
 
 ---
 
@@ -2573,6 +2684,8 @@ The orchestrator itself follows these principles:
 25. **Code Simplifier is conditional.** Skip in Agent Teams mode with clean code, for bug fixes, or for small tickets. Revert if it breaks tests. Never burn a loop iteration on simplifier regressions.
 26. **Detect context exhaustion.** If a Worker's output looks truncated, incomplete, or mentions context limitations, spawn a fresh Worker with the partial work. Don't let degraded output enter verification.
 27. **Agent Teams per ticket by default.** Deploy Context Agent + Worker Agent as teammates in a shared worktree. The orchestrator is team lead. The Worker should ASK the Context Agent for signatures and patterns instead of guessing. Only fall back to sequential subagents if the user explicitly chooses it or `CLAUDE_CODE_EXPERIMENTAL_AGENT_TEAMS` is not set.
+28. **Reconcile sprint-state against Linear on recovery.** After compaction or crash, never trust sprint-state.json alone. Cross-reference every ticket against actual Linear state (comments + status). Repair inconsistencies: post missing comments, mark Done if missed, demote phantom completes back to in_progress.
+29. **Context Agent exhaustion is a real risk.** The Context Agent self-monitors and emits warnings when it's answering from memory instead of reading files. The Worker must verify Context Agent answers by reading the file itself when warnings appear. A wrong signature from the Context Agent costs a full verification loop iteration.
 
 ---
 
@@ -2713,6 +2826,8 @@ echo "Cleanup complete."
     [ ] Circuit breaker: No ticket exceeded 2x same-error (or escalated to fresh agent)
     [ ] sprint-state.json updated per ticket (loop_count, status, last_error if any)
     [ ] Compaction check: sprint-state.json written if context >70%
+    [ ] If recovered from compaction: reconciled sprint-state against Linear (rollback safety)
+    [ ] Context Agent exhaustion: Worker noted any degradation and switched to direct reads
 
 [ ] Phase 4: Merge scheduling
     [ ] Conflict prediction completed (CONFLICT_MATRIX built)

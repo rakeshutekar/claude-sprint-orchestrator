@@ -342,7 +342,8 @@ The execution command. Fetches tickets from Linear, deploys Agent Teams per tick
 - **Stale base detection** — Rebases worktrees if base branch moved during sprint, preventing "passed against old code" failures
 - **Dependency drift detection** — Fresh npm install after any ticket that modifies package.json or lock files
 - **Code Simplifier safeguards** — Conditional execution (skipped in Agent Teams + clean code, bug fixes, small tickets). Auto-reverts if it breaks tests.
-- **Context exhaustion detection** — Detects truncated or degraded Worker output and spawns a fresh agent with partial work
+- **Context exhaustion detection** — Detects truncated or degraded Worker output and spawns a fresh agent with partial work. In Agent Teams mode, the Context Agent self-monitors for degradation and warns the Worker. The Worker verifies Context Agent answers by reading files directly when warnings appear.
+- **Crash recovery with rollback safety** — After compaction or crash, reconciles sprint-state.json against actual Linear state. Detects and repairs four inconsistency types: phantom completes, orphaned evidence comments, missing status changes, and stale in-progress states.
 - **Sprint dashboard** — Live `.claude/sprint-dashboard.md` for observability
 - **Post-sprint learning loop** — Auto-retrospective feeds learnings back to progress.txt, CLAUDE.md, and /tickets memory
 - **Human-in-loop mode** — Optional pause for human review before marking tickets Done
