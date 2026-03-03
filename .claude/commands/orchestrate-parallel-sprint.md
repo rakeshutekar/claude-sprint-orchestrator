@@ -172,26 +172,27 @@ echo ".claude/worktrees/" >> .gitignore && git add .gitignore && git commit -m "
 │       MISSING/MISMATCH → resume Worker → fix                  │    │
 │       OK ↓                                                     │    │
 │                                                                │    │
-│  Layer 2: VERIFICATION AGENT (Sonnet) — MECHANICAL        │    │
-│  └── Runs build+lint+typecheck+tests, checks EXIT CODES       │    │
-│  └── Asserts test_count > 0 (silent success = FAIL)           │    │
-│  └── Validates config (no skipLibCheck, no hidden permissive)  │    │
-│  └── Cross-checks worker's claimed counts vs actual ─────┐    │    │
-│       ANY FAIL or MISMATCH → resume Worker           │    │    │
-│       ALL PASS ↓                                     │    │    │
-│                                                      │    │    │
-│  Layer 2.5: EDGE CASE VERIFICATION (orchestrator)    │    │    │
-│  └── grep tests for each edge case from ticket desc  │    │    │
-│       MISSING TESTS → resume Worker                  │    │    │
-│       ALL COVERED ↓                                  │    │    │
-│                                                      │    │    │
-│  ⚡ CIRCUIT BREAKER: same error 2x → fresh agent     │    │    │
-│     fresh agent also fails → flag STUCK              │    │    │
-│                                                      │    │    │
-│  Layer 3: CODE REVIEW AGENT (Sonnet)             │    │    │
-│  └── Security, logic, patterns, edge cases ──────┐   │    │    │
-│       CRITICAL/HIGH → resume Worker          │   │    │    │
-│       PASS ↓                                 │   │    │    │
+│  Layers 2+3: RUN IN PARALLEL ─────────────────────────┐    │    │
+│  ┌─────────────────────────────┬──────────────────────┐│    │    │
+│  │ Layer 2: VERIFICATION AGENT │ Layer 3: CODE REVIEW ││    │    │
+│  │ (Sonnet) — MECHANICAL       │ (Sonnet) — QUALITY   ││    │    │
+│  │ • build+lint+type+tests     │ • Security, logic    ││    │    │
+│  │ • EXIT CODE assertions      │ • Patterns, edges    ││    │    │
+│  │ • test_count > 0            │ • CRITICAL/HIGH?     ││    │    │
+│  │ • config validation         │                      ││    │    │
+│  │ • cross-check worker counts │                      ││    │    │
+│  └─────────────┬───────────────┴──────────┬───────────┘│    │    │
+│                │ Gate: BOTH must pass      │            │    │    │
+│       ANY FAIL → combined feedback to Worker ─────┐    │    │
+│       BOTH PASS ↓                                 │    │    │
+│                                                   │    │    │
+│  Layer 2.5: EDGE CASE VERIFICATION (orchestrator) │    │    │
+│  └── grep tests for each edge case from ticket    │    │    │
+│       MISSING TESTS → resume Worker               │    │    │
+│       ALL COVERED ↓                               │    │    │
+│                                                   │    │    │
+│  ⚡ CIRCUIT BREAKER: same error 2x → fresh agent  │    │    │
+│     fresh agent also fails → flag STUCK           │    │    │
 │                                              │   │    │    │
 │  Layer 3.5: HUMAN REVIEW (if HUMAN_IN_LOOP) │   │    │    │
 │  └── Show diff + evidence → Approve? ────┐   │   │    │    │
@@ -420,6 +421,46 @@ shared brain across all agents. It persists learnings even when context windows 
 - **Every agent appends to progress.txt LAST** after completing work.
 - **Only genuinely reusable patterns** go in the Patterns section — not ticket-specific details.
 
+### Intra-Sprint Learning Buffer (Cross-Ticket Learning)
+
+Within a single sprint, tickets execute in parallel and can't naturally learn from each
+other. The orchestrator bridges this gap with a **sprint-local learnings buffer**:
+
+```
+INTRA_SPRINT_LEARNINGS = []   # In-memory buffer, also persisted to sprint-state.json
+
+After EACH ticket clears verification (Layer 5 PASS):
+  1. Extract learnings from the Worker's progress.txt additions
+  2. Extract error patterns from the verification loop (what failed, how it was fixed)
+  3. Append to INTRA_SPRINT_LEARNINGS buffer
+  4. Immediately write to progress.txt (so next agents read fresh learnings)
+
+Before spawning EACH new Worker Agent (or resuming for a fix):
+  1. Read INTRA_SPRINT_LEARNINGS buffer
+  2. Inject as "## Sprint-Local Learnings (from tickets completed this sprint)" section
+     into the Worker's prompt, AFTER the progress.txt Codebase Patterns section
+  3. This gives later Workers knowledge from earlier Workers' discoveries
+
+Example buffer entry:
+  {
+    "ticket_id": "CLA-40",
+    "timestamp": "2026-03-03T14:22:00Z",
+    "learnings": [
+      "vitest requires --experimental-vm-modules flag for ESM imports",
+      "Supabase client must be imported from @/lib/supabase, not supabase-js directly"
+    ],
+    "error_resolved": {
+      "type": "type_error",
+      "pattern": "Type 'string | undefined' not assignable to type 'string'",
+      "fix": "Use nullish coalescing: value ?? '' for string fields from Supabase"
+    }
+  }
+```
+
+**Why this matters:** Without this, if Ticket A discovers that `vitest` needs a flag,
+Tickets B through H all hit the same error independently — burning a loop iteration each.
+With the buffer, Ticket B's Worker reads the learning and avoids the error entirely.
+
 ---
 
 ## PHASE 0: PRE-FLIGHT
@@ -503,6 +544,60 @@ EOF
   git add progress.txt
   git commit -m "chore: initialize sprint progress.txt"
 fi
+```
+
+### Step 0F.5: Load Failure Pattern Database
+
+The failure pattern database accumulates structured error → resolution mappings across
+sprints. Workers and the orchestrator use it to pre-warn agents and short-circuit known issues.
+
+```bash
+# Initialize failure patterns file if it doesn't exist
+if [ ! -f .claude/failure-patterns.json ]; then
+  echo '{ "patterns": [], "last_updated": null }' > .claude/failure-patterns.json
+fi
+
+# Load patterns into orchestrator memory
+FAILURE_PATTERNS = read .claude/failure-patterns.json
+
+# Log known patterns for this sprint
+pattern_count=$(jq '.patterns | length' .claude/failure-patterns.json)
+echo "Loaded $pattern_count failure patterns from previous sprints"
+
+# If patterns reference specific modules, pre-warn workers:
+# e.g., "auth module historically causes type errors — pay extra attention to null checks"
+for each pattern in FAILURE_PATTERNS.patterns:
+    if pattern.frequency >= 3:
+        HIGH_FREQUENCY_PATTERNS.append(pattern)
+        echo "⚠️  High-frequency pattern: ${pattern.error_type} in ${pattern.module} (${pattern.frequency}x across sprints)"
+```
+
+**Schema:**
+```json
+{
+  "patterns": [
+    {
+      "id": "fp-001",
+      "error_type": "type_error",
+      "module": "src/services/auth",
+      "pattern": "Type 'string | undefined' not assignable",
+      "resolution": "Use nullish coalescing for Supabase nullable fields",
+      "frequency": 4,
+      "first_seen": "sprint-20260228",
+      "last_seen": "sprint-20260302",
+      "tickets_affected": ["CLA-40", "CLA-51", "CLA-58", "CLA-63"]
+    }
+  ],
+  "last_updated": "2026-03-02T15:30:00Z"
+}
+```
+
+The orchestrator injects `HIGH_FREQUENCY_PATTERNS` into Worker prompts as warnings:
+```
+## Known Failure Patterns (from previous sprints)
+⚠️  {module}: {error_type} occurs frequently ({frequency}x).
+    Known resolution: {resolution}
+    Apply this preemptively to avoid a verification loop iteration.
 ```
 
 ### Step 0G: Choose Coordination Mode
@@ -782,6 +877,52 @@ The Worker cannot ask follow-up questions. Context transfer is one-way and lossy
 
 ### Step 2A: Deploy Agent Team (per ticket)
 
+**Smart Worktree Strategy (Dependency-Aware Branching):**
+
+When a ticket has dependencies (e.g., Ticket B depends on Ticket A), its worktree should
+branch from A's merged result — not from the original `{BRANCH_BASE}`. This prevents the
+"can't find the service that Ticket A just created" problem that wastes a verification loop.
+
+```
+WORKTREE CREATION LOGIC:
+
+for each ticket in deployment order:
+    deps = ticket.dependencies  # from sprint-hints.json or Linear "blocked by"
+
+    if deps is empty OR all deps are not yet complete:
+        # No dependencies, or deps are still in progress — branch from base
+        WORKTREE_BASE = {BRANCH_BASE}
+        LOG: "Worktree for {TICKET_ID}: branching from {BRANCH_BASE} (no completed deps)"
+
+    elif all deps have status "complete" in sprint-state.json:
+        # All dependencies are done and merged — branch from current base
+        # (which already includes the merged dep code)
+        git checkout {BRANCH_BASE} && git pull  # Ensure we have merged dep code
+        WORKTREE_BASE = {BRANCH_BASE}
+        LOG: "Worktree for {TICKET_ID}: branching from {BRANCH_BASE} (deps merged)"
+
+    elif any dep has status "complete" but NOT yet merged:
+        # Dep is verified but still on its worktree branch (pre-Phase 4)
+        # Create worktree from BRANCH_BASE, then cherry-pick or merge dep branch
+        WORKTREE_BASE = {BRANCH_BASE}
+        POST_CREATE: git merge {DEP_WORKTREE_BRANCH} --no-ff -m "pre-merge dep {DEP_TICKET_ID}"
+        LOG: "Worktree for {TICKET_ID}: branching from {BRANCH_BASE} + pre-merged {DEP_TICKET_ID}"
+
+    # Create the worktree from the chosen base
+    git worktree add .claude/worktrees/{name} -b worktree-{name} {WORKTREE_BASE}
+
+    # Apply post-create merges if needed
+    if POST_CREATE exists:
+        cd .claude/worktrees/{name}
+        execute POST_CREATE
+        cd -
+
+DEPLOYMENT ORDER:
+  Wave 1 tickets (no deps) → deploy first, all in parallel
+  Wave 2 tickets (depend on Wave 1) → deploy after Wave 1 completes
+  Within a wave, independent tickets deploy in parallel
+```
+
 **Agent Teams Mode (default):**
 
 The orchestrator (team lead) spawns both agents as teammates in a single worktree.
@@ -789,7 +930,7 @@ Both agents are alive simultaneously and can message each other.
 
 ```yaml
 # The orchestrator creates an Agent Team per ticket:
-# 1. Create worktree for this ticket
+# 1. Create worktree for this ticket (using Smart Worktree Strategy above)
 # 2. Spawn Context Agent (Sonnet) as teammate — role: researcher
 # 3. Spawn Worker Agent (Opus) as teammate — role: implementer
 # 4. Both operate in the SAME worktree
@@ -820,8 +961,57 @@ Research the codebase and share your findings with the Worker:
 7. ADJACENT CODE — modules that import from or are imported by the target files
 8. DEPENDENCIES — other tickets or modules this ticket depends on
 
+## Warm Start: Starter Templates (CRITICAL — saves Worker time)
+After completing your initial research, generate STARTER TEMPLATES for the Worker.
+These are NOT stubs — they are real, compilable skeleton files with correct imports,
+function signatures, type annotations, and test scaffolding pre-filled.
+
+For each file the ticket will CREATE:
+```
+// Starter template for {file_path}
+// Generated by Context Agent from codebase analysis — Worker fills in business logic
+
+{correct import statements — derived from reading similar files in the codebase}
+{interface/type definitions — copied from TICKET_CONTEXT or discovered types}
+
+export function {functionName}({params}: {Types}): {ReturnType} {
+  // TODO: Worker implements business logic here
+  // Pattern to follow: {reference to similar existing function with file:line}
+  // Error handling: {throw AppError | return Result | try/catch — from error patterns}
+  throw new Error('Not implemented')
+}
+```
+
+For each TEST file the ticket will CREATE:
+```
+// Starter test template for {test_file_path}
+// Follows conventions from {existing_test_file_path}
+
+{correct test imports — describe/it/expect, vi.mock, fixtures}
+{mock setup — based on patterns discovered in similar test files}
+
+describe('{moduleName}', () => {
+  beforeEach(() => {
+    // Setup pattern from {existing_test_file}:{line}
+  })
+
+  it('should {happy path from acceptance criteria}', async () => {
+    // TODO: Worker implements test body
+  })
+
+  // Edge case tests (from ticket):
+  // {list each edge case as a commented-out it() block}
+})
+```
+
+WRITE these templates to the worktree as actual files. The Worker then fills in
+the business logic instead of starting from scratch. This eliminates:
+- Hallucinated import paths (you've verified them)
+- Wrong function signatures (you've read the types)
+- Mismatched test patterns (you've read existing tests)
+
 ## Follow-Up Questions
-After sharing your initial research, STAY AVAILABLE. The Worker will message you
+After sharing your initial research AND creating starter templates, STAY AVAILABLE. The Worker will message you
 with questions like:
   - "What's the exact signature of function X in file Y?"
   - "How do tests in this module mock the database?"
@@ -950,10 +1140,26 @@ case-insensitive prefix matching on ## headings. The heading "## Edge Cases (MAN
 should match the pattern for "Edge Cases". Never require exact string equality.
 }
 
+## Warm Start: Starter Templates (Agent Teams Mode)
+{IF COORDINATION_MODE == "agent-teams":
+  Your Context Agent teammate has created STARTER TEMPLATE FILES in this worktree.
+  These files have correct imports, function signatures, type annotations, and test
+  scaffolding already in place — derived from actual codebase analysis.
+
+  CHECK FOR STARTER TEMPLATES FIRST:
+  1. Look for files matching the ticket's "Files to Create" list
+  2. If they exist with TODO markers → fill in the business logic
+  3. If they DON'T exist → create files from scratch using ticket context
+  4. NEVER discard correct imports/signatures from templates to write your own
+
+  Starter templates save you from guessing at imports and signatures. Trust them
+  unless you find an error — in which case ASK the Context Agent to verify.
+}
+
 ## Context Agent Teammate (Agent Teams Mode)
 {IF COORDINATION_MODE == "agent-teams":
   You have a Context Agent teammate (Sonnet) in this worktree. It has already
-  researched the codebase. You can MESSAGE IT DIRECTLY for follow-up questions:
+  researched the codebase and created starter templates. You can MESSAGE IT DIRECTLY for follow-up questions:
   - "What's the exact signature of function X in file Y?"
   - "How do tests in this module mock the database?"
   - "What error handling pattern does service Z use?"
@@ -990,6 +1196,25 @@ should match the pattern for "Edge Cases". Never require exact string equality.
 
 ## Accumulated Learnings (from progress.txt)
 {PASTE THE CURRENT CONTENTS OF progress.txt — especially the Codebase Patterns section}
+
+## Sprint-Local Learnings (from tickets completed THIS sprint)
+{IF INTRA_SPRINT_LEARNINGS buffer is not empty:
+  PASTE entries — these are discoveries from other Workers in this sprint.
+  Pay special attention to:
+  - error_resolved patterns: these tell you how to AVOID errors others hit
+  - learnings: codebase quirks discovered during implementation
+  Use these to prevent repeating mistakes other Workers already solved.
+}
+{IF buffer is empty: "First ticket in this sprint — no prior learnings yet."}
+
+## Known Failure Patterns (from previous sprints)
+{IF HIGH_FREQUENCY_PATTERNS is not empty AND any pattern.module matches files in this ticket:
+  FOR EACH matching pattern:
+    "⚠️  {pattern.module}: {pattern.error_type} occurs frequently ({pattern.frequency}x across sprints).
+     Known resolution: {pattern.resolution}
+     Apply this preemptively to avoid a verification loop iteration."
+}
+{IF no matching patterns: omit this section entirely}
 
 ## Project Standards
 Read {PROJECT_STANDARDS} at the repo root FIRST. Follow it exactly.
@@ -1828,10 +2053,20 @@ while loop_count < MAX_LOOPS:
     # On loop_count > 0 (fix iterations), skip simplifier — the worker is
     # fixing specific issues, not producing fresh code for simplification.
 
-    # ─── Layer 2: Verification Agent (independent execution) ───
-    verification = run Verification Agent
-    # CAPTURE raw output for evidence assembly (Layer 5)
-    VERIFICATION_RAW_OUTPUT = verification.RAW_TERMINAL_OUTPUT  # from Task tool return
+    # ─── Layers 2 + 3: PARALLEL VERIFICATION + CODE REVIEW ───
+    # Verification Agent (mechanical) and Code Review Agent (quality) are INDEPENDENT.
+    # Running them in parallel cuts verification time nearly in half for passing tickets.
+    # Both are spawned simultaneously; we gate on "both pass" before Layer 4.
+
+    verification, review = run IN PARALLEL:
+        verification = run Verification Agent   # Layer 2: exit codes, test counts, config
+        review = run Code Review Agent          # Layer 3: security, logic, patterns
+
+    # CAPTURE raw outputs for evidence assembly (Layer 5)
+    VERIFICATION_RAW_OUTPUT = verification.RAW_TERMINAL_OUTPUT
+    CODE_REVIEW_RAW_OUTPUT = review.RAW_OUTPUT
+
+    # ─── Process Layer 2 result (Verification) ───
     if verification.VERIFIED == false:
         current_error = classify_error(verification.failures)
         if current_error.type == last_error?.type:
@@ -1839,7 +2074,11 @@ while loop_count < MAX_LOOPS:
         else:
             consecutive_same_error = 1
         last_error = current_error
-        resume Worker Agent → paste verification failures
+        # Include code review issues too (if any) to avoid another round trip
+        combined_feedback = verification.failures
+        if review.PASS == false:
+            combined_feedback += "\n\nAlso, code review found: " + review.issues_summary
+        resume Worker Agent → paste combined_feedback
         loop_count += 1
         update sprint-state.json
         continue
@@ -1852,7 +2091,20 @@ while loop_count < MAX_LOOPS:
         update sprint-state.json
         continue
 
-    # ─── Layer 2.5: Edge Case Verification (NEW) ───
+    # ─── Process Layer 3 result (Code Review) ───
+    if review.PASS == false:
+        current_error = { type: "code_review", message: review.issues_summary }
+        if current_error.type == last_error?.type:
+            consecutive_same_error += 1
+        else:
+            consecutive_same_error = 1
+        last_error = current_error
+        resume Worker Agent → paste review issues
+        loop_count += 1
+        update sprint-state.json
+        continue
+
+    # ─── Layer 2.5: Edge Case Verification (runs after both L2+L3 pass) ───
     # Verify that edge cases from the ticket description have corresponding tests
     if ticket_description contains heading matching /^##\s*Edge Cases/i:
         edge_cases = parse edge cases from ticket description
@@ -1883,22 +2135,6 @@ while loop_count < MAX_LOOPS:
             consecutive_same_error = 1
             update sprint-state.json
             continue
-
-    # ─── Layer 3: Code Review Agent ───
-    review = run Code Review Agent
-    # CAPTURE raw output for evidence assembly (Layer 5)
-    CODE_REVIEW_RAW_OUTPUT = review.RAW_OUTPUT  # from Task tool return
-    if review.PASS == false:
-        current_error = { type: "code_review", message: review.issues_summary }
-        if current_error.type == last_error?.type:
-            consecutive_same_error += 1
-        else:
-            consecutive_same_error = 1
-        last_error = current_error
-        resume Worker Agent → paste review issues
-        loop_count += 1
-        update sprint-state.json
-        continue
 
     # ─── Layer 3.5: Human-in-Loop (if HUMAN_IN_LOOP == true) ───
     if {HUMAN_IN_LOOP} == true:
@@ -2034,12 +2270,51 @@ if loop_count >= MAX_LOOPS:
     update sprint-state.json: tickets[{TICKET_ID}].status = "stuck"
     add Linear comment: "## Max Verification Loops Reached\n\nAttempts: {loop_count}/{MAX_LOOPS}\nLast error: {last_error.type} — {last_error.message}\nManual review needed."
 
-# ─── COMPACTION SAFETY CHECK ───
-# After each ticket's verification loop completes, check context health
+# ─── ORCHESTRATOR SELF-HEALTH MONITORING ───
+# The orchestrator monitors workers for context exhaustion but must also
+# monitor ITSELF. A sprint with 8 tickets generates massive context:
+# ticket descriptions, context reports, verification outputs, review outputs.
+# By ticket 6-7, the orchestrator risks degrading.
+
+# CHECK 1: Periodic context health (after EVERY ticket completes or gets stuck)
 if context_usage > 70%:
-    LOG: "Context at {context_usage}% — performing strategic compaction"
-    Write sprint progress summary to sprint-state.json
-    # Compaction will happen naturally; sprint-state.json survives it
+    LOG WARNING: "ORCHESTRATOR CONTEXT AT {context_usage}% — initiating strategic compaction"
+
+    # Write ALL critical state to durable storage before compaction
+    Write to sprint-state.json:
+      - All ticket statuses, loop counts, last errors
+      - INTRA_SPRINT_LEARNINGS buffer (full contents)
+      - Current phase and next ticket to process
+      - All agent_ids for resumable agents
+      - All worktree branch names
+      - VERIFICATION_RAW_OUTPUT and CODE_REVIEW_RAW_OUTPUT for current ticket (if mid-loop)
+
+    Write to progress.txt:
+      - Any pending Codebase Patterns not yet written
+
+    Write to sprint-dashboard.md:
+      - Full current state snapshot
+
+    LOG: "Strategic compaction: all state written to sprint-state.json + progress.txt + dashboard"
+    # Compaction will happen naturally; all three files survive it
+
+# CHECK 2: Detect orchestrator degradation signals (self-awareness)
+# After compaction or at >80% context, the orchestrator should watch for:
+ORCHESTRATOR_DEGRADATION_SIGNALS:
+  - Forgetting which tickets are complete (re-checking tickets already marked done)
+  - Losing agent_ids (can't resume workers, has to re-spawn)
+  - Dropping INTRA_SPRINT_LEARNINGS from memory (workers don't get cross-ticket knowledge)
+  - Failing to inject enriched context into worker prompts (falling back to bare prompts)
+  - Mixing up worktree branch names between tickets
+
+# If ANY degradation signal detected:
+if orchestrator_seems_degraded:
+    LOG WARNING: "ORCHESTRATOR DEGRADATION DETECTED — reloading state from disk"
+    RELOAD sprint-state.json → restore all ticket states, agent_ids, branch names
+    RELOAD progress.txt → restore codebase patterns and learnings
+    RELOAD .claude/failure-patterns.json → restore failure pattern database
+    RELOAD INTRA_SPRINT_LEARNINGS from sprint-state.json → restore cross-ticket buffer
+    LOG: "State reloaded. Continuing sprint with restored context."
 ```
 
 ### Compaction Recovery Protocol (with Rollback Safety)
@@ -2783,9 +3058,33 @@ After the retrospective agent returns:
    Write to .claude/agent-memory/tickets-explore/sprint-feedback.md
    (feeds back to /tickets Explore agent's persistent memory)
 
-4. Save full retrospective to .claude/sprint-history/{sprint_id}.md
+4. Update failure pattern database (.claude/failure-patterns.json):
+   For each ticket that triggered verification loops:
+     error_type = sprint-state.tickets[TICKET_ID].last_error.type
+     module = identify module from files changed
+     resolution = how the error was ultimately fixed
 
-5. Update sprint-state.json: phase = "complete"
+     # Check if this pattern already exists in the DB
+     existing = find pattern matching (error_type, module)
+     if existing:
+         existing.frequency += 1
+         existing.last_seen = sprint_id
+         existing.tickets_affected.append(TICKET_ID)
+     else:
+         add new pattern entry:
+           id: "fp-{next_id}"
+           error_type, module, pattern (from error message), resolution
+           frequency: 1
+           first_seen: sprint_id
+           last_seen: sprint_id
+           tickets_affected: [TICKET_ID]
+
+   Write updated .claude/failure-patterns.json
+   LOG: "Failure patterns updated: {N} new, {M} updated"
+
+5. Save full retrospective to .claude/sprint-history/{sprint_id}.md
+
+6. Update sprint-state.json: phase = "complete"
 ```
 
 ### Sprint History
@@ -2845,6 +3144,12 @@ The orchestrator itself follows these principles:
 27. **Agent Teams per ticket by default.** Deploy Context Agent + Worker Agent as teammates in a shared worktree. The orchestrator is team lead. The Worker should ASK the Context Agent for signatures and patterns instead of guessing. Only fall back to sequential subagents if the user explicitly chooses it or `CLAUDE_CODE_EXPERIMENTAL_AGENT_TEAMS` is not set.
 28. **Reconcile sprint-state against Linear on recovery.** After compaction or crash, never trust sprint-state.json alone. Cross-reference every ticket against actual Linear state (comments + status). Repair inconsistencies: post missing comments, mark Done if missed, demote phantom completes back to in_progress.
 29. **Context Agent exhaustion is a real risk.** The Context Agent self-monitors and emits warnings when it's answering from memory instead of reading files. The Worker must verify Context Agent answers by reading the file itself when warnings appear. A wrong signature from the Context Agent costs a full verification loop iteration.
+30. **Warm start templates accelerate workers.** Context Agents produce starter template files (correct imports, signatures, test scaffolding) in the worktree. Workers fill in business logic instead of starting from scratch. This eliminates hallucinated imports and wrong signatures — the #1 source of verification loop iterations.
+31. **Cross-ticket learning within a sprint.** After each ticket clears verification, extract learnings and error resolutions into the INTRA_SPRINT_LEARNINGS buffer. Inject this buffer into every subsequent Worker prompt. Later Workers should never repeat mistakes that earlier Workers already solved.
+32. **Parallel verification saves time.** Layers 2 (Verification Agent) and 3 (Code Review Agent) are independent — run them simultaneously. Gate on "both pass" before Layer 4. If both fail, combine feedback into a single Worker resume to avoid two round trips.
+33. **Smart worktrees respect dependencies.** When Ticket B depends on Ticket A, B's worktree should include A's code. Deploy tickets in wave order. Within a wave, parallelize. Between waves, ensure prior wave's code is available (merged to base or pre-merged into worktree).
+34. **Failure patterns persist across sprints.** The `.claude/failure-patterns.json` database accumulates error → resolution mappings. High-frequency patterns (3+ occurrences) are injected into Worker prompts as pre-warnings. The retrospective agent updates this database after every sprint.
+35. **Monitor your own health.** The orchestrator checks its context usage after every ticket completion. At >70%, it writes ALL critical state to durable storage (sprint-state.json, progress.txt, dashboard). Watch for degradation signals: forgetting ticket states, losing agent_ids, dropping learnings. Reload from disk if degraded.
 
 ---
 
@@ -2952,9 +3257,12 @@ echo "Cleanup complete."
     [ ] .claude/worktrees/ in .gitignore
     [ ] Stale worktrees cleaned
     [ ] progress.txt initialized
+    [ ] Failure pattern database loaded (.claude/failure-patterns.json)
+    [ ] High-frequency patterns logged (if any ≥3 occurrences)
     [ ] Coordination mode chosen (Subagents or Agent Teams)
     [ ] Agent Teams env flag verified (if Agent Teams mode)
     [ ] sprint-state.json initialized with all ticket entries
+    [ ] INTRA_SPRINT_LEARNINGS buffer initialized (empty)
     [ ] Sprint dashboard created (.claude/sprint-dashboard.md)
     [ ] Pre-flight log includes coordination mode + sprint-state status
 
@@ -2963,11 +3271,16 @@ echo "Cleanup complete."
     [ ] sprint-state.json updated (phase: "tickets_loaded")
 
 [ ] Phase 2: Agent pairs deployed
+    [ ] Smart worktree strategy: dependent tickets branch from dep's merged code
+    [ ] Deployment order respects waves (Wave 1 first, Wave 2 after Wave 1 completes)
+    [ ] Context agents created starter templates in worktrees (Agent Teams mode)
     [ ] {N} context agents returned with codebase research
     [ ] {N} worker agents completed in isolated worktrees
     [ ] All worker branch names and agent_ids stored
     [ ] All worker evidence blocks use EXACT format (no fabricated output)
     [ ] Workers received enriched ticket context (edge cases, file context, contracts, test patterns)
+    [ ] Workers received sprint-local learnings buffer (cross-ticket knowledge)
+    [ ] Workers received high-frequency failure pattern warnings (if any matched)
     [ ] sprint-state.json updated per ticket (phase: "implementation")
 
 [ ] Phase 2.5: Code Simplifier (conditional)
@@ -2980,12 +3293,14 @@ echo "Cleanup complete."
     [ ] Layer 0.5: All workers returned preflight_ran: true (rejected if missing)
     [ ] Layer 0.7: No context exhaustion detected (or fresh Worker spawned)
     [ ] Layer 1: All worker evidence blocks present (build/lint/type/test)
+    [ ] Layers 2+3: Verification + Code Review ran IN PARALLEL
     [ ] Layer 2: Verification agent confirmed all pass with EXIT CODES (mechanical)
     [ ] Layer 2: Test count > 0 for every ticket (silent success = FAIL)
     [ ] Layer 2: Config validation checked (no skipLibCheck, no hidden permissive rules)
     [ ] Layer 2: Cross-check passed (worker counts match actual counts)
-    [ ] Layer 2.5: Edge case verification — every edge case from ticket has a test
     [ ] Layer 3: Code review passed (CRITICAL=0, HIGH=0)
+    [ ] If both L2+L3 failed: combined feedback sent in single Worker resume (not 2 round trips)
+    [ ] Layer 2.5: Edge case verification — every edge case from ticket has a test
     [ ] Layer 3.5: Human review completed (if HUMAN_IN_LOOP=true)
     [ ] Layer 4: Completion agent returned COMPLETE verdict with requirement table (no Linear access)
     [ ] Layer 5: ORCHESTRATOR assembled evidence from raw outputs and posted to Linear (hard gate)
@@ -2994,7 +3309,10 @@ echo "Cleanup complete."
     [ ] Zero evidence mismatches detected across all tickets
     [ ] Circuit breaker: No ticket exceeded 2x same-error (or escalated to fresh agent)
     [ ] sprint-state.json updated per ticket (loop_count, status, last_error if any)
-    [ ] Compaction check: sprint-state.json written if context >70%
+    [ ] INTRA_SPRINT_LEARNINGS buffer updated after each ticket completion
+    [ ] Orchestrator self-health: context checked after every ticket (>70% → strategic compaction)
+    [ ] Orchestrator self-health: all state written to durable storage if >70%
+    [ ] Orchestrator self-health: no degradation signals detected (or state reloaded from disk)
     [ ] If recovered from compaction: reconciled sprint-state against Linear (rollback safety)
     [ ] Context Agent exhaustion: Worker noted any degradation and switched to direct reads
 
@@ -3043,6 +3361,7 @@ echo "Cleanup complete."
     [ ] Retrospective Agent analyzed sprint-state.json + dashboard + progress.txt
     [ ] RETROSPECTIVE_REPORT generated (what worked, what failed, patterns)
     [ ] progress.txt updated with sprint learnings
+    [ ] Failure pattern database updated (.claude/failure-patterns.json — new + updated patterns)
     [ ] CLAUDE.md suggestions presented to user (applied only with approval)
     [ ] /tickets Explore agent memory updated (TICKETS_FEEDBACK)
     [ ] Sprint history saved to .claude/sprint-history/{sprint_id}.md
