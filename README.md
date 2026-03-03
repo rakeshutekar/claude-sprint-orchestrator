@@ -307,7 +307,7 @@ The execution command. Fetches tickets from Linear, deploys Agent Teams per tick
 
 ### Key Features
 
-- **Agent Teams per ticket** — Context Agent (Sonnet) + Worker Agent (Opus) as live teammates in a shared worktree. The Worker asks follow-up questions, the Context Agent reads files on demand. No lossy context handoff.
+- **Agent Teams per ticket** — Context Agent (Sonnet) + Worker Agent (Opus) as live teammates in a shared worktree. The Worker asks follow-up questions, the Context Agent reads files on demand. No lossy context handoff. Agent Teams are restricted from touching Linear, only the independent verification chain handles ticket status.
 - **Isolated git worktrees** — Each ticket team gets its own worktree via Claude Code's native worktree support
 - **Circuit breaker** — Detects stuck agents (same error 2x), escalates to fresh agent or flags for manual intervention
 - **Error classification** — Routes failures intelligently: rate limits → wait, missing files → re-context, type errors → code fix
@@ -347,6 +347,16 @@ Injected into every agent prompt:
 - **No silent workarounds** — Report problems, don't hide them
 - **Strict evidence format** — COMMAND → EXIT_CODE → OUTPUT → VERDICT
 - **Compaction safety** — Re-run verification after context compaction
+
+### Trust Boundary: Collaborators vs Auditors
+
+The system enforces a strict separation between agents that build and agents that verify:
+
+- **Collaborators** (Agent Team: Context Agent + Worker Agent) — implement the ticket in a shared worktree. They are restricted from interacting with Linear MCP. They cannot mark tickets Done, post comments, or change status.
+- **Auditors** (Verification Agent, Code Review Agent, Completion Agent) — run as independent subagents regardless of coordination mode. Only the Completion Agent may post evidence comments and change ticket status on Linear.
+- **Hard gates** (Layer 5, Layer 5.5) — the orchestrator independently verifies on Linear that the evidence comment exists and the ticket status is Done. It never trusts agent self-reports.
+
+This prevents the Agent Team from short-circuiting the verification pipeline by marking tickets Done directly.
 
 ---
 

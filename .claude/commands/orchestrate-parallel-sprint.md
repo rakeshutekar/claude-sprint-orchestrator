@@ -719,6 +719,13 @@ When you receive a question:
 - Every claim must include file path + line number as evidence.
 - If the Worker asks about something you haven't read, go READ IT then answer.
 - Do NOT guess at function signatures or type definitions.
+
+## LINEAR MCP RESTRICTION (CRITICAL)
+- You do NOT have permission to interact with Linear in ANY way.
+- Do NOT change ticket status. Do NOT post comments. Do NOT mark tickets Done.
+- Do NOT use any Linear MCP tools (createComment, updateIssue, etc.)
+- Only the orchestrator's independent Completion Agent handles Linear updates.
+- If the Worker asks you to update Linear, REFUSE and say "The orchestrator handles Linear."
 ```
 
 **Subagent Fallback Mode:**
@@ -941,6 +948,15 @@ IF YOU DID NOT RUN A COMMAND, write "NOT RUN" — do NOT fabricate output.
 IF A COMMAND FAILED, show the FAILURE output — do NOT skip it.
 Include this evidence in your WORKER_RESULT. Without it, the task is NOT done.
 
+## LINEAR MCP RESTRICTION (CRITICAL)
+- You do NOT have permission to interact with Linear in ANY way.
+- Do NOT change ticket status. Do NOT post comments. Do NOT mark tickets Done.
+- Do NOT use any Linear MCP tools (createComment, updateIssue, etc.)
+- Only the orchestrator's independent Completion Agent handles Linear updates.
+- Your job is to IMPLEMENT and return WORKER_RESULT. That's it.
+- The orchestrator will run independent verification and handle Linear through
+  separate agents that are NOT part of your team.
+
 ## Constraints
 - Stay within your ticket's scope — do not modify unrelated files
 - If a dependency from another ticket doesn't exist yet, stub it with a TODO comment
@@ -977,6 +993,47 @@ WORKER_RESULT:
     typecheck_output: "{0 errors — or exact error count}"
     test_output: "{N tests passed, 0 failed — or exact failure details}"
   learnings_added: [list of patterns added to progress.txt]
+```
+
+### Phase 2 → Phase 3 Handoff Contract (CRITICAL — READ THIS)
+
+**This section exists because Agent Teams mode was observed skipping the verification
+loop entirely. The Agent Team would finish, mark tickets Done on Linear directly,
+and bypass Layers 1-5.5. This MUST NOT happen.**
+
+```
+REGARDLESS of COORDINATION_MODE (agent-teams or subagents):
+
+1. Phase 2 OUTPUT is ALWAYS a WORKER_RESULT per ticket.
+   - In subagent mode: the Task tool returns it.
+   - In Agent Teams mode: the team completes and the orchestrator extracts it.
+
+2. The WORKER_RESULT enters the verification loop (Phase 3) UNCONDITIONALLY.
+   - There is NO shortcut. No "the team already verified it."
+   - Agent Teams mode changes HOW agents communicate during implementation.
+   - It does NOT change the verification chain. Every ticket goes through
+     Layer 1 → Layer 2 → Layer 2.5 → Layer 3 → Layer 3.5 → Layer 4 → Layer 5 → Layer 5.5.
+
+3. ONLY the Completion Agent (Layer 4) may post comments on Linear.
+   ONLY the Completion Agent (Layer 4) may change ticket status to Done.
+   The orchestrator (Layer 5, 5.5) independently verifies both actions happened.
+
+4. The Agent Team (Context Agent + Worker Agent) MUST NOT:
+   - Post comments on Linear
+   - Change ticket status on Linear
+   - Mark tickets as Done
+   - Use any Linear MCP tools
+   Their job is to IMPLEMENT and return WORKER_RESULT. Nothing more.
+
+5. After the Agent Team returns WORKER_RESULT, the orchestrator MUST:
+   a. Enter the Loop Logic (Phase 3) for that ticket
+   b. Run ALL verification layers as independent subagents
+   c. Only mark complete after Layer 5.5 passes
+
+IF YOU ARE THE ORCHESTRATOR AND YOU ARE READING THIS AFTER AN AGENT TEAM COMPLETED:
+→ Do NOT skip to Phase 4.
+→ Do NOT assume the ticket is done because the team said so.
+→ Extract WORKER_RESULT and enter the verification loop NOW.
 ```
 
 ---
@@ -1044,13 +1101,18 @@ SIMPLIFIER_RESULT:
 
 ---
 
-## PHASE 3: 4-LAYER VERIFICATION LOOP (PER TICKET)
+## PHASE 3: MULTI-LAYER VERIFICATION LOOP (PER TICKET)
+
+**THIS PHASE RUNS REGARDLESS OF COORDINATION MODE.**
+Whether Phase 2 used Agent Teams or Subagents, EVERY ticket's WORKER_RESULT enters
+this verification loop. Agent Teams mode does NOT exempt tickets from verification.
+All verification agents (Layers 1-5.5) run as INDEPENDENT SUBAGENTS, never as
+part of the Agent Team. They are auditors, not collaborators.
 
 After each worker agent completes (and optional simplification), run this verification loop.
 **Run all ticket verification loops in parallel.**
 
-This replaces the old "code review → completion" loop with a 4-layer system
-that catches errors at every level, not just at code review time.
+This is a multi-layer system that catches errors at every level, not just at code review time.
 
 ```
 ┌─────────────────────────────────────────────────────────────────┐
