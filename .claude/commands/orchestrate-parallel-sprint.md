@@ -150,21 +150,32 @@ echo ".claude/worktrees/" >> .gitignore && git add .gitignore && git commit -m "
                                                   │
                                                   ▼
 ┌─────────────────────────────────────────────────────────────────────┐
-│    PHASE 2.5: CODE SIMPLIFIER (per ticket, non-blocking)           │
-│    Refine worker code for clarity → re-run quality gate            │
+│    PHASE 2.5: CODE SIMPLIFIER (conditional, non-blocking)          │
+│    Skip if Agent Teams + clean code. Run if subagents/5+ files.    │
+│    Safeguard: revert if tests break after simplification.          │
 └───────────────────────────────┬─────────────────────────────────────┘
                                 │
                                 ▼
 ┌─────────────────────────────────────────────────────────────────────┐
 │       PHASE 3: VERIFICATION LOOP (PER TICKET)                      │
 │                                                                     │
+│  Pre-check: STALE BASE DETECTION (rebase if base moved)            │
+│                                                                     │
+│  Layer 0.5: PREFLIGHT CHECK (did worker run all 4 commands?)       │
+│  └── preflight_ran == false → reject, send back to Worker          │
+│                                                                     │
+│  Layer 0.7: CONTEXT EXHAUSTION CHECK (truncated output?)           │
+│  └── Degraded output → spawn fresh Worker with partial work        │
+│                                                                     │
 │  Layer 1: EVIDENCE CHECK (orchestrator — no agent)                 │
 │  └── Evidence present? Cross-check counts? ───────────────────┐    │
 │       MISSING/MISMATCH → resume Worker → fix                  │    │
 │       OK ↓                                                     │    │
 │                                                                │    │
-│  Layer 2: VERIFICATION AGENT (Sonnet 4.6)                     │    │
-│  └── Independently runs build+lint+typecheck+tests            │    │
+│  Layer 2: VERIFICATION AGENT (Sonnet 4.6) — MECHANICAL        │    │
+│  └── Runs build+lint+typecheck+tests, checks EXIT CODES       │    │
+│  └── Asserts test_count > 0 (silent success = FAIL)           │    │
+│  └── Validates config (no skipLibCheck, no hidden permissive)  │    │
 │  └── Cross-checks worker's claimed counts vs actual ─────┐    │    │
 │       ANY FAIL or MISMATCH → resume Worker           │    │    │
 │       ALL PASS ↓                                     │    │    │
@@ -237,6 +248,15 @@ echo ".claude/worktrees/" >> .gitignore && git add .gitignore && git commit -m "
 │  └────────┬─────────┘                                               │
 │           │  Stuck ticket? (PARTIAL_MERGE) → skip + revert          │
 └───────────┼─────────────────────────────────────────────────────────┘
+            │
+            ▼
+┌─────────────────────────────────────────────────────────────────────┐
+│         PHASE 4.5: PRE-MERGE INTEGRATION CHECK                     │
+│  Temp branch → merge ALL tickets → npm install → full test suite   │
+│  Test fixture collision detection across tickets                   │
+│  If FAIL → isolate culprit → route to ORIGINAL Worker Agent        │
+│  If PASS → proceed to real merges with confidence                  │
+└───────────────────────────────────────────────────────────────────┬─┘
             │
             ▼
 ┌─────────────────────────────────────────────────────────────────────┐
@@ -900,13 +920,54 @@ ELSE:
 9. Commit: "{COMMIT_PREFIX}: {ticket title} ({TICKET_ID})"
 10. Do NOT push — the orchestrator handles merging
 
+## PREFLIGHT CHECKLIST (MANDATORY — RUN BEFORE RETURNING)
+
+Before returning WORKER_RESULT, you MUST run this sequential checklist.
+This is NOT optional. If you skip it, the Verification Agent catches it and you
+get sent back — wasting a loop iteration. Save time: catch it yourself.
+
+```bash
+# STEP 1: Run ALL four commands in sequence. Capture exit codes.
+echo "=== PREFLIGHT: BUILD ===" && {BUILD_CMD}
+BUILD_EXIT=$?
+
+echo "=== PREFLIGHT: LINT ===" && {LINT_CMD}
+LINT_EXIT=$?
+
+echo "=== PREFLIGHT: TYPECHECK ===" && {TYPECHECK_CMD}
+TYPECHECK_EXIT=$?
+
+echo "=== PREFLIGHT: TESTS ===" && {TEST_CMD}
+TEST_EXIT=$?
+
+# STEP 2: CHECK EXIT CODES — ALL must be 0
+if [ $BUILD_EXIT -ne 0 ]; then echo "PREFLIGHT FAIL: BUILD"; fi
+if [ $LINT_EXIT -ne 0 ]; then echo "PREFLIGHT FAIL: LINT"; fi
+if [ $TYPECHECK_EXIT -ne 0 ]; then echo "PREFLIGHT FAIL: TYPECHECK"; fi
+if [ $TEST_EXIT -ne 0 ]; then echo "PREFLIGHT FAIL: TESTS"; fi
+
+# STEP 3: If ANY exit code is non-zero → FIX IT NOW
+# Do NOT return WORKER_RESULT with failures. Fix and re-run the checklist.
+# You have the context to fix it. The Verification Agent does not.
+
+# STEP 4: Verify test count > 0
+# Parse the test output. If "0 tests" or "no test suites found" → FAIL.
+# You MUST have written tests. Zero tests is not acceptable.
+```
+
+If ALL four commands exit 0 AND test count > 0, proceed to evidence collection.
+If ANY command fails, FIX THE ISSUE and re-run the preflight. Do NOT skip.
+
 ## EVIDENCE COLLECTION (MANDATORY — NO FAKING)
-Before claiming you are done, you MUST capture evidence using this EXACT format.
+After the preflight passes, capture evidence using this EXACT format.
 The Verification Agent will independently re-run these commands. If your reported
 numbers don't match reality, the ticket FAILS and you get sent back to fix it.
 
 ```
 EVIDENCE:
+  preflight_ran: true  # You MUST have run the preflight above
+  all_exit_codes_zero: true  # All four commands exited 0
+
   build:
     command: "{BUILD_CMD}"
     exit_code: {0 or N}
@@ -937,7 +998,7 @@ EVIDENCE:
     output: |
       {paste ACTUAL test output — full summary line}
     verdict: PASS or FAIL
-    passed: {N}
+    passed: {N}  # MUST be > 0
     failed: {N}
     skipped: {N}
 
@@ -946,6 +1007,7 @@ EVIDENCE:
 
 IF YOU DID NOT RUN A COMMAND, write "NOT RUN" — do NOT fabricate output.
 IF A COMMAND FAILED, show the FAILURE output — do NOT skip it.
+IF preflight_ran is false, the orchestrator will REJECT your WORKER_RESULT immediately.
 Include this evidence in your WORKER_RESULT. Without it, the task is NOT done.
 
 ## LINEAR MCP RESTRICTION (CRITICAL)
@@ -1045,12 +1107,35 @@ IF YOU ARE THE ORCHESTRATOR AND YOU ARE READING THIS AFTER AN AGENT TEAM COMPLET
 
 ## PHASE 2.5: CODE SIMPLIFIER (PER TICKET — BEFORE VERIFICATION)
 
-After each worker agent completes but BEFORE verification, run the code-simplifier
+After each worker agent completes but BEFORE verification, optionally run the code-simplifier
 to clean up the worker's code. This uses the `code-simplifier` plugin agent (Opus)
 which refines code for clarity, consistency, and maintainability WITHOUT changing behavior.
 
 **Why here:** If we simplify after verification, we'd need to re-verify. By simplifying
 before verification, the cleaned-up code gets verified in one pass.
+
+### Safeguard: When to SKIP the Simplifier
+
+```
+SKIP the Code Simplifier if:
+1. COORDINATION_MODE == "agent-teams" AND the Worker Agent reported clean code
+   (Agent Teams mode produces better code because the Worker asks the Context Agent
+   for patterns in real-time, reducing the need for post-hoc simplification)
+2. The ticket is a bug fix (title matches /^(fix|bug|hotfix|patch):/i)
+   (Bug fixes should be minimal — don't restructure a targeted fix)
+3. The ticket touched < 3 files (not enough code to justify a simplification pass)
+4. Previous sprint retrospective flagged the simplifier as causing regressions
+
+RUN the Code Simplifier if:
+1. COORDINATION_MODE == "subagents" (worker had less context, code may be rougher)
+2. Worker touched 5+ files (more surface area for improvement)
+3. User explicitly enabled it
+
+If the simplifier runs and breaks tests:
+→ git reset --hard to the pre-simplification commit
+→ LOG WARNING: "Simplifier broke tests — reverted. Proceeding with original code."
+→ Do NOT retry. Do NOT burn a loop iteration on this.
+```
 
 ### Step 2C: Code Simplifier Agent (per ticket)
 
@@ -1117,6 +1202,41 @@ part of the Agent Team. They are auditors, not collaborators.
 After each worker agent completes (and optional simplification), run this verification loop.
 **Run all ticket verification loops in parallel.**
 
+### Pre-Verification: Stale Base Branch Check
+
+Before entering the verification loop, check if {BRANCH_BASE} has moved since the
+worktree was created. If other developers (or a previous sprint) pushed to {BRANCH_BASE},
+the worker's code was verified against a stale snapshot and may fail on current base.
+
+```
+base_at_sprint_start = git rev-parse sprint-start-{timestamp}  # from Phase 0 tag
+base_now = git rev-parse {BRANCH_BASE}
+
+if base_at_sprint_start != base_now:
+    LOG WARNING: "STALE BASE DETECTED: {BRANCH_BASE} has moved since sprint start"
+    LOG WARNING: "Sprint started at {base_at_sprint_start}, now at {base_now}"
+
+    # Rebase each worktree branch onto current base
+    for each ticket worktree branch:
+        git checkout {WORKTREE_BRANCH}
+        rebase_result = git rebase {BRANCH_BASE}
+
+        if rebase has conflicts:
+            LOG ERROR: "Rebase conflict for {TICKET_ID} — routing to Worker Agent"
+            git rebase --abort
+            resume Worker Agent → "The base branch has been updated since you started.
+                Your branch has conflicts with the current base. Rebase your changes
+                onto the latest {BRANCH_BASE} and resolve conflicts."
+            # Worker fixes, then re-enters verification loop
+
+        # After successful rebase, re-run worker preflight
+        {BUILD_CMD} && {LINT_CMD} && {TYPECHECK_CMD} && {TEST_CMD}
+        if any fail:
+            resume Worker Agent → "After rebasing onto updated base, your code fails: {output}"
+
+    git checkout {BRANCH_BASE}
+```
+
 This is a multi-layer system that catches errors at every level, not just at code review time.
 
 ```
@@ -1178,48 +1298,95 @@ You are the VERIFICATION AGENT for ticket {TICKET_ID}: "{TICKET_TITLE}".
 Never trust claims. Only trust command output you run yourself.
 The worker agent CLAIMS everything passes. Your job is to VERIFY independently.
 
-## Your Task — Run These Commands FRESH
-Checkout the worker's branch and run every verification command yourself:
+## Your Task — Run These Commands FRESH (MECHANICAL ASSERTIONS)
+Checkout the worker's branch and run every verification command yourself.
+You are a MECHANICAL VERIFIER. Check exit codes, not interpretations.
 
 ```bash
 git checkout {WORKTREE_BRANCH}
 
 # 1. Build
 {BUILD_CMD}
-# CAPTURE full output. Exit code MUST be 0.
+BUILD_EXIT=$?
+# ASSERTION: BUILD_EXIT MUST be 0. Any non-zero = FAIL. No exceptions.
 
 # 2. Lint
 {LINT_CMD}
-# CAPTURE full output. Must show 0 errors.
+LINT_EXIT=$?
+# ASSERTION: LINT_EXIT MUST be 0. Any non-zero = FAIL.
 
 # 3. Typecheck
 {TYPECHECK_CMD}
-# CAPTURE full output. Must show 0 errors.
+TYPECHECK_EXIT=$?
+# ASSERTION: TYPECHECK_EXIT MUST be 0. Any non-zero = FAIL.
 
 # 4. Tests
 {TEST_CMD}
-# CAPTURE full output. Must show 0 failures.
+TEST_EXIT=$?
+# ASSERTION: TEST_EXIT MUST be 0. Any non-zero = FAIL.
 
-# 5. Check for debug artifacts
+# 5. SILENT SUCCESS DETECTION (CRITICAL)
+# A command can exit 0 but test NOTHING. Check for this:
+# - Parse test output for test count. If "0 tests" or "no tests found" → FAIL.
+# - Parse lint output for file count. If "0 files linted" → FAIL.
+# - The MINIMUM test count is 1. Ideally >= 3 per new function.
+# Report: TEST_COUNT, LINT_FILE_COUNT, TYPECHECK_FILE_COUNT
+
+# 6. CONFIG VALIDATION (catches hidden permissiveness)
+# Check that project config is not silently hiding errors:
+#   - tsconfig.json: skipLibCheck should be false (or not set)
+#   - tsconfig.json: strict should be true (or noImplicitAny + strictNullChecks)
+#   - eslint config: no "off" rules for critical categories (no-unused-vars, no-undef)
+#   - jest/vitest config: no testPathIgnorePatterns that skip the files we changed
+# Report any permissive config as CONFIG_WARNING (not blocking, but flagged)
+
+# 7. Check for debug artifacts
 grep -rn "console.log\|debugger\|TODO.*HACK" {files_changed} || echo "CLEAN"
 
 # Return to base
 git checkout {BRANCH_BASE}
 ```
 
-## Output Format (REQUIRED — with ACTUAL command output)
+## MECHANICAL ASSERTION RULES (NON-NEGOTIABLE)
+1. Exit code 0 = PASS. Non-zero = FAIL. No interpretation. No "it mostly passed."
+2. Test count MUST be > 0. If the test runner reports 0 tests, that is a FAIL.
+3. If a command times out, that is a FAIL (not "it probably would have passed").
+4. If a command is not configured (e.g., no TYPECHECK_CMD), report "SKIPPED" not "PASS".
+5. Capture the FULL output of every command. Truncate to last 50 lines if too long.
+
+## Output Format (REQUIRED — with ACTUAL command output + exit codes)
 VERIFICATION_RESULT:
   ticket_id: {TICKET_ID}
-  build: PASS | FAIL
-    output: "{actual last 10 lines of build output}"
-  lint: PASS | FAIL
+
+  build:
+    exit_code: {BUILD_EXIT}
+    verdict: PASS | FAIL
+    output: "{actual last 20 lines of build output}"
+
+  lint:
+    exit_code: {LINT_EXIT}
+    verdict: PASS | FAIL
+    files_linted: {N}  # MUST be > 0
     output: "{actual lint output}"
-  typecheck: PASS | FAIL
+
+  typecheck:
+    exit_code: {TYPECHECK_EXIT}
+    verdict: PASS | FAIL | SKIPPED
     output: "{actual typecheck output}"
-  tests: PASS | FAIL
-    output: "{actual test output — pass count, fail count}"
+
+  tests:
+    exit_code: {TEST_EXIT}
+    verdict: PASS | FAIL
+    test_count: {N}  # MUST be > 0. Zero tests = FAIL.
+    passed: {N}
+    failed: {N}
+    skipped: {N}
+    output: "{actual test output — full summary}"
     coverage: "{if available}"
+
   debug_artifacts: CLEAN | FOUND [{list}]
+
+  config_warnings: [{list of permissive config settings found, if any}]
 
   ## CROSS-CHECK AGAINST WORKER CLAIMS
   worker_claimed_tests_passed: {N from WORKER_RESULT}
@@ -1230,7 +1397,18 @@ VERIFICATION_RESULT:
   # If false → FLAG: "EVIDENCE MISMATCH — worker claimed X, reality is Y"
   # Evidence mismatches are treated as CRITICAL — the worker may be hallucinating.
 
-  VERIFIED: true | false (true ONLY if ALL above are PASS/CLEAN AND EVIDENCE_MATCHES)
+  ## SILENT SUCCESS CHECK
+  SILENT_SUCCESS: true | false
+  # true if any command exited 0 but produced no meaningful output
+  # (0 tests, 0 files linted, etc.) — this is treated as FAIL.
+
+  VERIFIED: true | false
+  # true ONLY if ALL of:
+  #   - Every exit code is 0
+  #   - Test count > 0
+  #   - No silent success detected
+  #   - EVIDENCE_MATCHES is true
+  #   - Debug artifacts CLEAN
 ```
 
 **If VERIFIED = false:**
@@ -1425,6 +1603,29 @@ while loop_count < MAX_LOOPS:
         if error contains "timeout" or "ETIMEDOUT":
             return { type: "timeout", action: "retry_with_backoff" }
         return { type: "unknown", action: "resume_worker" }
+
+    # ─── Layer 0.5: Preflight check (orchestrator — no agent) ───
+    if worker_result.evidence.preflight_ran != true:
+        LOG WARNING: "Worker skipped preflight checklist — rejecting WORKER_RESULT"
+        resume Worker Agent → "You did NOT run the preflight checklist. Run ALL four commands ({BUILD_CMD}, {LINT_CMD}, {TYPECHECK_CMD}, {TEST_CMD}) and include exit codes before returning."
+        loop_count += 1
+        last_error = { type: "preflight_skipped", message: "Worker did not run preflight" }
+        update sprint-state.json
+        continue
+
+    # ─── Layer 0.7: Context exhaustion check (orchestrator — no agent) ───
+    # Detect if the Worker Agent's output seems truncated or degraded
+    if worker_result seems truncated OR evidence block is incomplete OR
+       worker_result contains "I'll continue..." or "Due to context limitations...":
+        LOG WARNING: "CONTEXT EXHAUSTION DETECTED for {TICKET_ID} — Worker output may be degraded"
+        # Spawn a FRESH worker agent with partial work context
+        spawn NEW Worker Agent with:
+          - Full ticket description + context agent output
+          - "PREVIOUS AGENT may have hit context limits. Their partial work is at branch {WORKTREE_BRANCH}."
+          - "Review their commits, complete any missing work, run full preflight, and return."
+        last_error = { type: "context_exhaustion", message: "Worker output truncated" }
+        update sprint-state.json
+        continue
 
     # ─── Layer 1: Evidence check (orchestrator — no agent) ───
     if worker_result.evidence is missing or shows errors:
@@ -1749,6 +1950,101 @@ CONFLICT_CONTEXT: {
 }
 ```
 
+### Step 4A.5: Pre-Merge Integration Check (CRITICAL — catches cross-ticket failures)
+
+Before committing to real merges, test all tickets together on a temporary branch.
+This catches semantic conflicts that per-ticket verification cannot detect — two tickets
+that both pass alone but break each other when combined.
+
+```
+# 1. Create a temporary integration branch from current base
+git checkout {BRANCH_BASE}
+git checkout -b integration-test-{sprint_id}
+
+# 2. Merge ALL completed ticket branches (in the scheduled MERGE_ORDER)
+integration_failures = []
+for each branch in MERGE_ORDER:
+    result = git merge worktree-{name} --no-ff -m "integration-test: {TICKET_ID}"
+    if result has conflicts:
+        # Record the conflict but try to continue
+        integration_failures.append({
+            ticket: TICKET_ID,
+            type: "merge_conflict",
+            conflicting_files: [list of files]
+        })
+        git merge --abort
+        continue  # Skip this ticket in integration test
+
+# 3. Run FULL quality gate on the merged result
+npm install  # Fresh install to catch dependency drift (Point D)
+{BUILD_CMD}
+{LINT_CMD}
+{TYPECHECK_CMD}
+{TEST_CMD}
+
+# 4. Capture exit codes mechanically
+if any command has exit_code != 0:
+    # Identify which tickets interact to cause the failure
+    # Use incremental approach: merge tickets one at a time
+    LOG: "Integration test FAILED — isolating culprit interaction"
+
+    git checkout {BRANCH_BASE}
+    git checkout -b integration-bisect-{sprint_id}
+
+    for each branch in MERGE_ORDER:
+        git merge worktree-{name} --no-ff
+        result = {BUILD_CMD} && {TEST_CMD}
+        if result FAILED:
+            LOG: "Failure introduced by merging {TICKET_ID} on top of previous tickets"
+            # Route back to the ORIGINAL Worker Agent (not a cold Build Gate Agent)
+            # The Worker has context about what it built and why
+            resume Worker Agent for {TICKET_ID} → paste failure output +
+                "Your code passes in isolation but FAILS when combined with other
+                 sprint tickets. The integration test shows: {failure_output}.
+                 Fix the compatibility issue. The other tickets that are already
+                 merged are: {list_merged_tickets}."
+            # Worker fixes, re-run integration from this point
+            break
+
+# 5. TEST ISOLATION CHECK
+# Detect colliding test fixtures across tickets:
+# - Grep all test files for hardcoded IDs, fixture names, or test data
+# - If two tickets use the same test fixture ID (e.g., "test-user-1"),
+#   they'll collide when tests run together
+test_fixture_collisions = []
+for each pair of ticket branches:
+    fixtures_a = grep -rn "test-.*\|mock-.*\|fixture-.*\|seed.*=" test_files_a
+    fixtures_b = grep -rn "test-.*\|mock-.*\|fixture-.*\|seed.*=" test_files_b
+    overlap = intersection of fixture names
+    if overlap is not empty:
+        test_fixture_collisions.append({
+            ticket_a: TICKET_A_ID,
+            ticket_b: TICKET_B_ID,
+            colliding_fixtures: overlap
+        })
+
+if test_fixture_collisions is not empty:
+    LOG WARNING: "TEST FIXTURE COLLISIONS DETECTED: {test_fixture_collisions}"
+    # Route to the later ticket's Worker Agent to rename their fixtures
+    for each collision:
+        resume Worker Agent for later_ticket → "Your test fixtures collide with
+            {other_ticket}: {colliding_fixtures}. Rename your fixtures to be unique
+            (use your ticket ID as prefix, e.g., '{TICKET_ID}-test-user-1')."
+
+# 6. If integration test passes → proceed to real merges
+# 7. Clean up temporary branches
+git checkout {BRANCH_BASE}
+git branch -D integration-test-{sprint_id} 2>/dev/null
+git branch -D integration-bisect-{sprint_id} 2>/dev/null
+```
+
+**Why this matters:** Previously, cross-ticket failures were only caught in Phase 5
+(Build Gate) after real merges, where a cold Build Gate Agent tried to fix code it
+didn't write. Now failures are caught BEFORE real merges and routed back to the
+original Worker Agent who has full context.
+
+---
+
 ### Step 4B: Merge Executor (Sequential)
 
 The orchestrator executes merges in the scheduled order.
@@ -1768,7 +2064,14 @@ git log --oneline worktree-{name} -5
 git merge worktree-{name} --no-ff -m "merge: {TICKET_TITLE} ({TICKET_ID})"
 
 # 4. If conflict → spawn Conflict Agent (Step 4C)
-# 5. If clean → verify build
+# 5. If clean → check for dependency drift then verify build
+# DEPENDENCY DRIFT CHECK: If this ticket modified package.json or lock files,
+# run a fresh install to ensure dependencies are consistent.
+if git diff --name-only pre-merge-{TICKET_ID}..HEAD | grep -q "package.json\|package-lock.json\|yarn.lock\|pnpm-lock.yaml"; then
+    LOG: "Dependency change detected in {TICKET_ID} — running fresh install"
+    npm install  # or yarn/pnpm based on project
+fi
+
 {BUILD_CMD}
 {TYPECHECK_CMD}
 
@@ -2262,7 +2565,14 @@ The orchestrator itself follows these principles:
 17. **Verify edge cases exist in tests.** Layer 2.5 in the verification loop checks that every edge case from the ticket description has a corresponding test case.
 18. **Run retrospective at sprint end.** Phase 8 is not optional. Learnings feed back to progress.txt, CLAUDE.md, and /tickets memory.
 19. **Only the orchestrator touches Linear.** No agent posts comments or changes ticket status. The orchestrator captures raw terminal output from Verification and Code Review agents via Task tool returns, assembles the evidence comment itself, posts it via Linear MCP, and marks the ticket Done. Raw terminal output IS proof. Agent-written summaries are NOT proof.
-20. **Agent Teams per ticket by default.** Deploy Context Agent + Worker Agent as teammates in a shared worktree. The orchestrator is team lead. The Worker should ASK the Context Agent for signatures and patterns instead of guessing. Only fall back to sequential subagents if the user explicitly chooses it or `CLAUDE_CODE_EXPERIMENTAL_AGENT_TEAMS` is not set.
+20. **Worker preflight is non-negotiable.** If a Worker returns WORKER_RESULT without `preflight_ran: true`, reject it immediately and send it back. Workers must self-verify before claiming done.
+21. **Mechanical verification over interpretation.** The Verification Agent checks exit codes (0 or non-zero), test counts (> 0), and config permissiveness. It does not interpret output — it asserts against hard thresholds.
+22. **Pre-merge integration before real merges.** Always run Step 4A.5 (temp branch + merge all + full test suite) before committing to real merges. Route cross-ticket failures back to the original Worker Agent, not a cold Build Gate Agent.
+23. **Detect stale base before verification.** If `{BRANCH_BASE}` moved since sprint start, rebase worktrees before entering the verification loop. A ticket verified against a stale base is not verified.
+24. **Dependency drift = fresh install.** If any ticket modified `package.json` or lock files, run `npm install` after merging that ticket. Dependencies are code — treat them as such.
+25. **Code Simplifier is conditional.** Skip in Agent Teams mode with clean code, for bug fixes, or for small tickets. Revert if it breaks tests. Never burn a loop iteration on simplifier regressions.
+26. **Detect context exhaustion.** If a Worker's output looks truncated, incomplete, or mentions context limitations, spawn a fresh Worker with the partial work. Don't let degraded output enter verification.
+27. **Agent Teams per ticket by default.** Deploy Context Agent + Worker Agent as teammates in a shared worktree. The orchestrator is team lead. The Worker should ASK the Context Agent for signatures and patterns instead of guessing. Only fall back to sequential subagents if the user explicitly chooses it or `CLAUDE_CODE_EXPERIMENTAL_AGENT_TEAMS` is not set.
 
 ---
 
@@ -2378,13 +2688,19 @@ echo "Cleanup complete."
     [ ] Workers received enriched ticket context (edge cases, file context, contracts, test patterns)
     [ ] sprint-state.json updated per ticket (phase: "implementation")
 
-[ ] Phase 2.5: Code Simplifier
-    [ ] {N} tickets simplified (or skipped if simplifier broke tests)
-    [ ] Quality gate still passes after simplification
+[ ] Phase 2.5: Code Simplifier (conditional)
+    [ ] Simplifier skip/run decision logged (Agent Teams + clean → skip; subagents/5+ files → run)
+    [ ] {N} tickets simplified (or skipped per safeguard rules)
+    [ ] Quality gate still passes after simplification (or reverted if broken)
 
 [ ] Phase 3: Verification Loop
+    [ ] Stale base check: {BRANCH_BASE} compared to sprint-start tag, rebased if needed
+    [ ] Layer 0.5: All workers returned preflight_ran: true (rejected if missing)
+    [ ] Layer 0.7: No context exhaustion detected (or fresh Worker spawned)
     [ ] Layer 1: All worker evidence blocks present (build/lint/type/test)
-    [ ] Layer 2: Verification agent independently confirmed all pass
+    [ ] Layer 2: Verification agent confirmed all pass with EXIT CODES (mechanical)
+    [ ] Layer 2: Test count > 0 for every ticket (silent success = FAIL)
+    [ ] Layer 2: Config validation checked (no skipLibCheck, no hidden permissive rules)
     [ ] Layer 2: Cross-check passed (worker counts match actual counts)
     [ ] Layer 2.5: Edge case verification — every edge case from ticket has a test
     [ ] Layer 3: Code review passed (CRITICAL=0, HIGH=0)
@@ -2402,7 +2718,20 @@ echo "Cleanup complete."
     [ ] Conflict prediction completed (CONFLICT_MATRIX built)
     [ ] Dependency-ordered merge plan created (high-conflict pairs merged early)
     [ ] CONFLICT_CONTEXT prepared (intent per shared file)
+
+[ ] Phase 4.5: Pre-merge integration check
+    [ ] Temp integration branch created
+    [ ] All completed tickets merged into temp branch
+    [ ] npm install ran (dependency drift check)
+    [ ] Full test suite ran on merged result
+    [ ] Test fixture collisions checked across tickets
+    [ ] If failed: culprit isolated and routed to ORIGINAL Worker Agent (not cold Build Gate)
+    [ ] If passed: temp branch cleaned up, proceed to real merges
+    [ ] Integration check result logged in sprint-state.json
+
+[ ] Phase 4 continued: Real merges
     [ ] All branches merged (conflicts resolved with intent context)
+    [ ] Dependency drift: npm install ran after each ticket with package.json changes
     [ ] Post-merge conflict verification passed (Step 4D — both tickets' tests pass)
     [ ] Merged worktrees cleaned up
     [ ] Sprint dashboard updated with merge progress
@@ -2411,7 +2740,7 @@ echo "Cleanup complete."
     [ ] Build passes
     [ ] Lint passes
     [ ] Typecheck passes
-    [ ] Unit tests pass
+    [ ] Unit tests pass (test count > 0)
     [ ] If build failed: bisection protocol identified failing merge
     [ ] If PARTIAL_MERGE: failing ticket reverted, remaining tickets intact
     [ ] Sprint dashboard updated ({M}/{N} tickets merged status)

@@ -178,12 +178,13 @@ The execution command. Fetches tickets from Linear, deploys Agent Teams per tick
 1. **Pre-flight** — Validates Linear MCP, git state, baseline build. User chooses coordination mode (Agent Teams recommended, Subagents fallback). Initializes sprint-state.json checkpoints
 2. **Fetch tickets** — Queries Linear for matching tickets
 3. **Deploy Agent Teams** — Per ticket: orchestrator (team lead) spawns Context Agent (Sonnet) + Worker Agent (Opus) as teammates in a shared worktree. They communicate directly, the Worker asks follow-up questions, the Context Agent reads files on demand
-4. **Code simplifier** — Optional refine pass for clarity before verification
-5. **Multi-layer verification loop** — Evidence check → Independent verification → Edge case verification → Code review → Human review (optional) → Completion verdict → Orchestrator assembles raw proof and posts to Linear (Layer 5) → Orchestrator marks Done and verifies (Layer 5.5)
-6. **Merge scheduling** — Conflict prediction via file overlap analysis, intent context for resolution, post-merge verification
-7. **Build gate** — Full quality gate with bisection protocol for failure isolation
-8. **E2E behavioral verification** — Per-ticket endpoint testing, DB state checks, integration verification
-9. **Auto-retrospective** — Analyzes sprint performance, feeds learnings back to progress.txt and /tickets memory
+4. **Code simplifier** — Conditional refine pass (skipped in Agent Teams with clean code, for bug fixes, or small tickets). Auto-reverts if it breaks tests.
+5. **Multi-layer verification loop** — Stale base check → Worker preflight validation → Context exhaustion detection → Evidence check → Mechanical verification (exit codes, test count > 0, config validation) → Edge case verification → Code review → Human review (optional) → Completion verdict → Orchestrator assembles raw proof and posts to Linear → Orchestrator marks Done and verifies
+6. **Pre-merge integration check** — Merges ALL tickets into a temp branch and runs full test suite BEFORE real merges. Catches cross-ticket failures early. Routes failures back to the original Worker Agent (not a cold Build Gate Agent). Detects test fixture collisions across tickets.
+7. **Merge scheduling** — Conflict prediction via file overlap analysis, intent context for resolution, dependency drift detection (fresh npm install after package.json changes), post-merge verification
+8. **Build gate** — Full quality gate with bisection protocol for failure isolation
+9. **E2E behavioral verification** — Per-ticket endpoint testing, DB state checks, integration verification
+10. **Auto-retrospective** — Analyzes sprint performance, feeds learnings back to progress.txt and /tickets memory
 
 ### `/sprint` Flow
 
@@ -226,23 +227,27 @@ The execution command. Fetches tickets from Linear, deploys Agent Teams per tick
                                 │
                                 ▼
 ┌─────────────────────────────────────────────────────────────────────┐
-│    PHASE 2.5: CODE SIMPLIFIER (per ticket, non-blocking)           │
-│    Refine worker code for clarity → re-run quality gate            │
+│    PHASE 2.5: CODE SIMPLIFIER (conditional, non-blocking)          │
+│    Skip: Agent Teams + clean code, bug fixes, small tickets        │
+│    Run: subagents mode, 5+ files. Auto-revert if tests break.     │
 └───────────────────────────────┬─────────────────────────────────────┘
                                 │
                                 ▼
 ┌─────────────────────────────────────────────────────────────────────┐
 │       PHASE 3: VERIFICATION LOOP (PER TICKET)                      │
 │                                                                     │
-│  Layer 1: EVIDENCE CHECK (orchestrator — no agent)                 │
-│  Layer 2: VERIFICATION AGENT (independently re-runs everything)    │
-│  Layer 2.5: EDGE CASE VERIFICATION (grep tests for each case)     │
+│  Pre: STALE BASE CHECK (rebase if base branch moved)               │
+│  L0.5: PREFLIGHT CHECK (did worker run all 4 commands?)            │
+│  L0.7: CONTEXT EXHAUSTION CHECK (truncated output → fresh Worker)  │
+│  L1: EVIDENCE CHECK (orchestrator — no agent)                      │
+│  L2: MECHANICAL VERIFICATION (exit codes, test count > 0, config)  │
+│  L2.5: EDGE CASE VERIFICATION (grep tests for each case)          │
 │  ⚡ CIRCUIT BREAKER: same error 2x → fresh agent or flag STUCK     │
-│  Layer 3: CODE REVIEW AGENT (security, logic, patterns)            │
-│  Layer 3.5: HUMAN REVIEW (optional, if HUMAN_IN_LOOP=true)        │
-│  Layer 4: COMPLETION AGENT (verdict only, no Linear access)        │
-│  Layer 5: ORCHESTRATOR POSTS PROOF (raw terminal output to Linear) │
-│  Layer 5.5: ORCHESTRATOR MARKS DONE (sets + verifies on Linear)    │
+│  L3: CODE REVIEW AGENT (security, logic, patterns)                 │
+│  L3.5: HUMAN REVIEW (optional, if HUMAN_IN_LOOP=true)             │
+│  L4: COMPLETION AGENT (verdict only, no Linear access)             │
+│  L5: ORCHESTRATOR POSTS PROOF (raw terminal output to Linear)      │
+│  L5.5: ORCHESTRATOR MARKS DONE (sets + verifies on Linear)         │
 │                                                                     │
 └───────────────────────────────┬─────────────────────────────────────┘
                                 │
@@ -250,9 +255,23 @@ The execution command. Fetches tickets from Linear, deploys Agent Teams per tick
 ┌─────────────────────────────────────────────────────────────────────┐
 │              PHASE 4: MERGE SCHEDULING                              │
 │  Scheduler Agent: conflict prediction + merge ordering              │
-│  Merge Executor: sequential merges with pre-merge tags              │
 │  Conflict Agent: resolves with intent context + edge cases          │
-│  Post-merge verification: both tickets' tests must pass             │
+└───────────────────────────────┬─────────────────────────────────────┘
+                                │
+                                ▼
+┌─────────────────────────────────────────────────────────────────────┐
+│         PHASE 4.5: PRE-MERGE INTEGRATION CHECK                     │
+│  Temp branch → merge ALL tickets → npm install → full test suite   │
+│  Test fixture collision detection across tickets                   │
+│  FAIL → isolate culprit → route to ORIGINAL Worker Agent           │
+│  PASS → proceed to real merges with confidence                     │
+└───────────────────────────────┬─────────────────────────────────────┘
+                                │
+                                ▼
+┌─────────────────────────────────────────────────────────────────────┐
+│         PHASE 4 (cont): MERGE EXECUTOR                             │
+│  Sequential merges with pre-merge tags + dependency drift checks   │
+│  Post-merge verification: both tickets' tests must pass            │
 └───────────────────────────────┬─────────────────────────────────────┘
                                 │
                                 ▼
@@ -317,6 +336,13 @@ The execution command. Fetches tickets from Linear, deploys Agent Teams per tick
 - **Bisection protocol** — Binary search using pre-merge tags to isolate which merge broke the build
 - **Partial merge / graceful degradation** — Ships completed tickets even when some are stuck
 - **Edge case verification** — Layer 2.5 greps test files for every edge case from the ticket description
+- **Worker preflight checklist** — Workers must run all 4 quality commands and verify exit codes before returning. Rejected immediately if preflight not run.
+- **Mechanical verification** — Verification Agent checks exit codes (not interpretations), asserts test count > 0, validates project config for hidden permissiveness (skipLibCheck, silenced lint rules)
+- **Pre-merge integration check** — All tickets merged into a temp branch and tested together BEFORE real merges. Catches cross-ticket semantic conflicts. Routes failures back to the original Worker Agent (who has context), not a cold Build Gate Agent. Detects test fixture collisions across tickets.
+- **Stale base detection** — Rebases worktrees if base branch moved during sprint, preventing "passed against old code" failures
+- **Dependency drift detection** — Fresh npm install after any ticket that modifies package.json or lock files
+- **Code Simplifier safeguards** — Conditional execution (skipped in Agent Teams + clean code, bug fixes, small tickets). Auto-reverts if it breaks tests.
+- **Context exhaustion detection** — Detects truncated or degraded Worker output and spawns a fresh agent with partial work
 - **Sprint dashboard** — Live `.claude/sprint-dashboard.md` for observability
 - **Post-sprint learning loop** — Auto-retrospective feeds learnings back to progress.txt, CLAUDE.md, and /tickets memory
 - **Human-in-loop mode** — Optional pause for human review before marking tickets Done
