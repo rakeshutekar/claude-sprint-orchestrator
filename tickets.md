@@ -130,6 +130,38 @@ If the user doesn't provide config, use the defaults above and ask only for FEAT
 
 ## PHASE 0: PRE-FLIGHT
 
+### Step 0-Pre: Load Problem Statement (from /define)
+
+Check if `/define` was run before this command:
+
+```bash
+if [ -f .claude/problem-statement.md ]; then
+  echo "📋 Found problem statement from /define. Loading..."
+  PROBLEM_STATEMENT = read .claude/problem-statement.md
+
+  # Extract key fields for use throughout /tickets:
+  # - PROBLEM_DESCRIPTION: Enriches FEATURE context beyond the one-liner
+  # - SUCCESS_CRITERIA: Used in Phase 3 (Approval Gate) to validate all criteria have tickets
+  # - USER_JOURNEY: Used in Phase 2.75 to generate more targeted edge cases
+  # - TESTING_STRATEGY: Used to set test expectations per ticket
+  # - IMPLIED_FEATURES: Cross-checked against generated ticket list
+  # - CONSTRAINTS: Passed to Context Agents as hard constraints
+  # - CODEBASE_SNAPSHOT: Accelerates Phase 1 (Explore Agent already knows the stack)
+
+  echo "  Problem: $(head -n1 of Problem section)"
+  echo "  Success criteria: {N} items"
+  echo "  Testing level: {level}"
+  echo "  Constraints: {count or 'none'}"
+  echo ""
+  echo "Tip: /define context will enrich ticket quality. The Explore Agent will"
+  echo "     skip basic stack detection since /define already captured it."
+else
+  echo "ℹ️  No problem statement found. Running without /define context."
+  echo "   Tip: Run /define first for better ticket quality."
+  PROBLEM_STATEMENT = null
+fi
+```
+
 ### Step 0A: Check Linear MCP
 ```
 Fetch one issue from LINEAR_TEAM using Linear MCP tools.
@@ -175,6 +207,7 @@ git check-ignore -q .claude/worktrees/ 2>/dev/null || echo ".claude/worktrees/" 
 # Ensure sprint dashboard and state files are gitignored
 git check-ignore -q .claude/sprint-dashboard.md 2>/dev/null || echo ".claude/sprint-dashboard.md" >> .gitignore
 git check-ignore -q .claude/sprint-state.json 2>/dev/null || echo ".claude/sprint-state.json" >> .gitignore
+git check-ignore -q .claude/problem-statement.md 2>/dev/null || echo ".claude/problem-statement.md" >> .gitignore
 ```
 
 ---
@@ -217,6 +250,21 @@ After completing your analysis, UPDATE your agent memory:
     integration points, and any corrections to previous entries
 
 Analyze the codebase for implementing: "{FEATURE}"
+
+## Problem Statement Context (from /define)
+{IF PROBLEM_STATEMENT is not null:
+  PASTE the following sections from .claude/problem-statement.md:
+  - Problem section (what's broken/missing and for whom)
+  - Definition of Done / User Journey (the steps the user expects to work)
+  - Constraints (hard constraints that limit implementation choices)
+  - Codebase Snapshot (stack, test infra — you can skip re-discovering these)
+
+  Use this to FOCUS your analysis on the areas that matter for this problem.
+  The user journey steps tell you which parts of the codebase to examine most carefully.
+}
+{IF PROBLEM_STATEMENT is null:
+  No problem statement available. Analyze broadly based on FEATURE description.
+}
 
 ## What to Map
 1. ARCHITECTURE — project structure, key directories, framework/stack used
@@ -651,7 +699,13 @@ Present the full plan to the user. Display:
 6. **Complexity changes** — any tickets that were split or resized in Phase 2.75C
 7. **Rollback plans** — count of tickets with rollback specs
 8. **Unverified items** — any remaining [UNVERIFIED] references (should be 0)
-9. **Sprint config** — the exact `/sprint` config that will be generated
+9. **Problem statement coverage** (if PROBLEM_STATEMENT loaded) — validate:
+   - Every success criterion from the problem statement is covered by at least one ticket
+   - Every implied feature has a corresponding ticket
+   - Testing strategy matches what was requested (e.g., if user said "full coverage," all tickets have E2E scenarios)
+   - Constraints are respected (no ticket violates a hard constraint)
+   - If any criterion is UNCOVERED, flag it: "⚠️ Success criterion '{X}' has no ticket covering it"
+10. **Sprint config** — the exact `/sprint` config that will be generated
 
 Then ask:
 

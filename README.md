@@ -1,32 +1,40 @@
 # Claude Sprint Orchestrator
 
-A multi-agent sprint orchestration system for [Claude Code](https://docs.anthropic.com/en/docs/claude-code) that turns Linear tickets into fully implemented, verified, and merged code, using Agent Teams (Context Agent + Worker Agent as live teammates) working in parallel isolated git worktrees.
+A multi-agent sprint orchestration system for [Claude Code](https://docs.anthropic.com/en/docs/claude-code) that turns ideas into fully implemented, verified, and merged code, using Agent Teams (Context Agent + Worker Agent as live teammates) working in parallel isolated git worktrees.
 
-> **Two slash commands. One pipeline.** `/tickets` plans your work. `/sprint` executes it.
+> **Three slash commands. One pipeline.** `/define` captures intent. `/tickets` plans your work. `/sprint` executes it.
 
 ---
 
 ## How It Works
 
-The system is built around two Claude Code custom slash commands that form an end-to-end pipeline:
+The system is built around three Claude Code custom slash commands that form an end-to-end pipeline:
 
 ```
    Your idea
       │
       ▼
+  /define
+      │
+      │  Quick codebase recon → structured dialogue (3-5 min) →
+      │  problem statement with success criteria, user journey,
+      │  testing strategy, and constraints
+      │
+      ▼
   /tickets "Build a notification system"
       │
-      │  Analyzes codebase → generates plan → creates Linear tickets
-      │  with edge cases, file context, caller-callee contracts,
-      │  test patterns, and rollback plans
+      │  Reads problem statement → analyzes codebase → generates plan →
+      │  creates Linear tickets with edge cases, file context,
+      │  caller-callee contracts, test patterns, and rollback plans →
+      │  validates all success criteria have ticket coverage
       │
       ▼
   /sprint
       │
-      │  Fetches tickets → deploys Agent Teams per ticket →
+      │  Reads problem statement → fetches tickets → deploys Agent Teams →
       │  Context + Worker as live teammates → multi-layer verification →
-      │  conflict-aware merging → E2E behavioral testing →
-      │  auto-retrospective
+      │  conflict-aware merging → E2E behavioral testing (using user
+      │  journey as test scenarios) → auto-retrospective
       │
       ▼
    Merged, verified, tested code on your branch
@@ -34,9 +42,54 @@ The system is built around two Claude Code custom slash commands that form an en
 
 ---
 
+## `/define` — From Idea to Problem Statement
+
+The intent capture command. Through a focused 3-5 minute dialogue (informed by a quick codebase scan), it produces a structured problem statement that becomes the contract for the entire pipeline.
+
+### What It Does
+
+1. **Quick codebase recon** (~10 seconds, silent) — Detects stack, test infrastructure, database/auth presence, and key directories. No agents, no deep reads — just enough to ask informed questions.
+2. **Structured dialogue** (4-7 questions) — Asks one question at a time, adapting follow-ups based on codebase context and previous answers.
+3. **Problem statement generation** — Produces `.claude/problem-statement.md` with problem description, user journey, success criteria, testing strategy, constraints, and codebase snapshot.
+4. **Handoff** — Offers to launch `/tickets` immediately or save for later.
+
+### Core Questions
+
+| # | Question | Purpose | Always Asked? |
+|---|----------|---------|---------------|
+| Q1 | What problem are you solving? | Captures the *why*, not the *what* | Yes |
+| Q2 | What does "done" look like? | User journey → E2E test scenarios + success criteria | Yes |
+| Q3 | What level of testing? | Configures test expectations (adapts to existing test infra) | Yes |
+| Q4 | Any constraints? | Libraries, deadlines, tech debt, external deps | Yes |
+| Q5 | Database changes? | New tables vs extend existing (only if DB detected) | Conditional |
+| Q6 | Auth/permissions? | Public vs authenticated vs role-based (only if auth detected) | Conditional |
+| Q7 | External integrations? | Third-party APIs, webhooks, services | Conditional |
+
+### How It Connects Downstream
+
+The problem statement flows through the entire pipeline:
+
+| Consumer | What It Uses | How |
+|----------|-------------|-----|
+| `/tickets` Explore Agent | Codebase snapshot + constraints | Focuses analysis on relevant areas, skips re-discovering stack basics |
+| `/tickets` Approval Gate | Success criteria + implied features | Validates every criterion has at least one ticket covering it |
+| `/sprint` Worker Agent | Constraints | Passed as hard constraints in Worker prompts |
+| `/sprint` Completion Agent (L4) | Success criteria | Checks tickets against relevant criteria from the problem statement |
+| `/sprint` E2E Test Agent (Phase 6) | User journey steps | Each step becomes an agent-browser verification scenario |
+| `/sprint` Retrospective (Phase 8) | Full problem statement | Compares actual output against original intent |
+
+### Key Design Decisions
+
+- **Optional but recommended** — `/tickets` works without it; just prints a nudge: "Tip: Run `/define` first for better ticket quality"
+- **Shallow recon only** — Reads manifest files and directory structure. No agents, no deep code analysis. That's `/tickets`' job.
+- **One question at a time** — Conversation, not a form. Follow-ups adapt to answers.
+- **Max 7 questions** — 3-5 minutes. Short enough that users won't skip it.
+
+---
+
 ## `/tickets` — From Idea to Linear Tickets
 
-The planning command. Given a feature description, it analyzes your codebase, generates an implementation plan, breaks it into agent-sized tickets with rich context, and creates them on Linear.
+The planning command. Given a feature description (enriched by `/define`'s problem statement if available), it analyzes your codebase, generates an implementation plan, breaks it into agent-sized tickets with rich context, and creates them on Linear.
 
 ### What It Does
 
@@ -157,6 +210,7 @@ The planning command. Given a feature description, it analyzes your codebase, ge
 - **Rollback plans** — Auto-generated for schema/migration/integration tickets
 - **Persistent Explore memory** — Codebase knowledge accumulates across `/tickets` runs
 - **Anti-hallucination guardrails** — Every agent is required to show evidence with file paths and line numbers
+- **Problem statement integration** — Reads `.claude/problem-statement.md` from `/define` if available. Enriches Explore Agent focus, validates all success criteria have ticket coverage at the Approval Gate, and passes constraints to Context Agents.
 - **Baseline build verification** — Phase 0 verifies the base branch compiles before generating tickets
 - **Sprint hints** — Saves ticket metadata (.claude/sprint-hints.json) for /sprint to pre-populate state and detect stale plans
 - **Coordination mode recommendation** — Analyzes ticket complexity to recommend Agent Teams vs Subagents
@@ -439,6 +493,7 @@ Raw terminal output IS proof. Agent-written summaries are NOT proof. The orchest
 ```bash
 # Option A: Copy commands directly into your project
 mkdir -p your-project/.claude/commands
+cp .claude/commands/define-problem.md your-project/.claude/commands/
 cp .claude/commands/orchestrate-parallel-sprint.md your-project/.claude/commands/
 cp .claude/commands/tickets.md your-project/.claude/commands/
 ```
@@ -446,6 +501,7 @@ cp .claude/commands/tickets.md your-project/.claude/commands/
 ```bash
 # Option B: Clone and symlink
 git clone https://github.com/rakeshutekar/claude-sprint-orchestrator.git
+ln -s $(pwd)/claude-sprint-orchestrator/.claude/commands/define-problem.md your-project/.claude/commands/
 ln -s $(pwd)/claude-sprint-orchestrator/.claude/commands/orchestrate-parallel-sprint.md your-project/.claude/commands/
 ln -s $(pwd)/claude-sprint-orchestrator/.claude/commands/tickets.md your-project/.claude/commands/
 ```
@@ -466,6 +522,14 @@ echo ".claude/worktrees/" >> .gitignore
 
 ## Usage
 
+### Step 0: Define the Problem (Recommended)
+
+```
+/define
+```
+
+This starts a 3-5 minute structured dialogue. It scans your codebase (quick recon), then asks 4-7 focused questions about what you're building, what "done" looks like, and how you want it tested. Produces `.claude/problem-statement.md`.
+
 ### Step 1: Generate Tickets
 
 ```
@@ -473,7 +537,7 @@ echo ".claude/worktrees/" >> .gitignore
           email fallback, and user preference management"
 ```
 
-This will analyze your codebase, generate a plan, and after your approval, create tickets on Linear with full context.
+This will analyze your codebase (using the problem statement for focus if available), generate a plan, validate all success criteria have ticket coverage, and after your approval, create tickets on Linear with full context.
 
 ### Step 2: Run the Sprint
 
@@ -556,9 +620,11 @@ Each agent runs independently. The orchestrator passes all context between them 
 your-project/
 ├── .claude/
 │   ├── commands/
-│   │   ├── orchestrate-parallel-sprint.md   # /sprint command (3500+ lines)
-│   │   └── tickets.md                       # /tickets command (1300+ lines)
+│   │   ├── define-problem.md                # /define command (~300 lines)
+│   │   ├── orchestrate-parallel-sprint.md   # /sprint command (3600+ lines)
+│   │   └── tickets.md                       # /tickets command (1350+ lines)
 │   ├── worktrees/                           # Auto-created, must be in .gitignore
+│   ├── problem-statement.md                 # From /define — intent contract (auto-created)
 │   ├── sprint-state.json                    # Sprint checkpoint (auto-created)
 │   ├── sprint-preflight.json                # Context pre-flight checkpoint (temporary)
 │   ├── sprint-dashboard.md                  # Live status (auto-created)

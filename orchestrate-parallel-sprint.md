@@ -712,6 +712,7 @@ git check-ignore -q .claude/sprint-dashboard.md 2>/dev/null || echo ".claude/spr
 git check-ignore -q .claude/sprint-state.json 2>/dev/null || echo ".claude/sprint-state.json" >> .gitignore
 git check-ignore -q .claude/sprint-hints.json 2>/dev/null || echo ".claude/sprint-hints.json" >> .gitignore
 git check-ignore -q .claude/sprint-preflight.json 2>/dev/null || echo ".claude/sprint-preflight.json" >> .gitignore
+git check-ignore -q .claude/problem-statement.md 2>/dev/null || echo ".claude/problem-statement.md" >> .gitignore
 
 # 3. Commit gitignore changes if any
 if ! git diff --quiet .gitignore 2>/dev/null; then
@@ -800,6 +801,36 @@ The orchestrator injects `HIGH_FREQUENCY_PATTERNS` into Worker prompts as warnin
     Known resolution: {resolution}
     Apply this preemptively to avoid a verification loop iteration.
 ```
+
+### Step 0F.7: Load Problem Statement (from /define)
+
+Check if `/define` was run before `/tickets`:
+
+```bash
+if [ -f .claude/problem-statement.md ]; then
+  echo "📋 Found problem statement from /define. Loading..."
+  PROBLEM_STATEMENT = read .claude/problem-statement.md
+
+  # Extract key fields for use during sprint:
+  # - USER_JOURNEY: E2E Test Agent (Phase 6) uses these as verification scenarios
+  # - SUCCESS_CRITERIA: Completion Agent (Layer 4) checks tickets against these
+  # - TESTING_STRATEGY: Configures how aggressive Phase 6 E2E testing should be
+  # - CONSTRAINTS: Passed to Worker Agents as context
+
+  user_journey_steps = extract "User Journey" section → count steps
+  success_criteria = extract "Success Criteria" section → count items
+  testing_level = extract "Testing Strategy > Level" field
+  echo "  User journey: ${user_journey_steps} steps"
+  echo "  Success criteria: ${success_criteria} items"
+  echo "  Testing level: ${testing_level}"
+  PROBLEM_STATEMENT_LOADED=true
+else
+  echo "ℹ️  No problem statement found (optional — /define was not run)."
+  PROBLEM_STATEMENT_LOADED=false
+fi
+```
+
+---
 
 ### Step 0G: Choose Coordination Mode
 
@@ -2119,6 +2150,15 @@ You may NOT claim this ticket is complete unless you have:
 ## Original Ticket Description
 {TICKET_DESCRIPTION}
 
+## Problem Statement Success Criteria (from /define)
+{IF PROBLEM_STATEMENT_LOADED:
+  These are the overall success criteria the user defined for the feature.
+  Check which criteria THIS ticket is responsible for and verify them:
+  {PASTE relevant success criteria from .claude/problem-statement.md}
+  If this ticket doesn't cover any success criteria, note "N/A — this ticket
+  is infrastructure/internal" and continue with ticket-level requirements only.
+}
+
 ## Your Task — Line-by-Line Requirement Matching
 For EACH requirement/acceptance criterion in the ticket:
 
@@ -3097,7 +3137,15 @@ If no E2E test runner is configured, skip to Step 3.
 
 ## Step 3: Browser-Based Behavioral Verification (agent-browser)
 This is the PRIMARY verification method. Use agent-browser to interact with
-the running application and verify the feature works end-to-end:
+the running application and verify the feature works end-to-end.
+
+{IF PROBLEM_STATEMENT_LOADED:
+  ## User Journey Scenarios (from /define)
+  The user defined these as their expected experience when the feature is complete.
+  Test EACH step as a browser interaction:
+  {PASTE user journey steps from .claude/problem-statement.md}
+  Each step = one agent-browser interaction sequence with evidence capture.
+}
 
   a. NAVIGATE to the feature:
      ```bash
@@ -3581,6 +3629,9 @@ echo "Cleanup complete."
     [ ] progress.txt initialized
     [ ] Failure pattern database loaded (.claude/failure-patterns.json)
     [ ] High-frequency patterns logged (if any ≥3 occurrences)
+    [ ] Problem statement loaded (if .claude/problem-statement.md exists from /define)
+    [ ] User journey steps extracted for Phase 6 E2E scenarios
+    [ ] Success criteria extracted for Layer 4 Completion Agent
     [ ] Coordination mode chosen (Subagents or Agent Teams)
     [ ] Agent Teams env flag verified (if Agent Teams mode)
     [ ] sprint-state.json initialized with all ticket entries
