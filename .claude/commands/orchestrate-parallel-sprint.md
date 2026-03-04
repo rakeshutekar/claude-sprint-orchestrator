@@ -1001,44 +1001,34 @@ This affects how Phase 2 deploys its agents.
 
 If user selects Agent Teams, verify the experimental flag is set:
 ```bash
-# Check if agent teams are enabled — search multiple locations:
-AGENT_TEAMS_ENABLED=false
+# Check if agent teams are enabled (search multiple locations)
+AGENT_TEAMS_FOUND=false
+for config_file in .claude/settings.json ~/.claude/settings.json .claude.json; do
+  if grep -q "CLAUDE_CODE_EXPERIMENTAL_AGENT_TEAMS" "$config_file" 2>/dev/null; then
+    AGENT_TEAMS_FOUND=true
+    break
+  fi
+done
 
-# Location 1: Environment variable (most common)
-if [ -n "$CLAUDE_CODE_EXPERIMENTAL_AGENT_TEAMS" ]; then
-    AGENT_TEAMS_ENABLED=true
+# Also check environment variable
+if [ "$CLAUDE_CODE_EXPERIMENTAL_AGENT_TEAMS" = "1" ]; then
+  AGENT_TEAMS_FOUND=true
 fi
 
-# Location 2: Project settings (.claude/settings.json)
-if grep -q "CLAUDE_CODE_EXPERIMENTAL_AGENT_TEAMS" .claude/settings.json 2>/dev/null; then
-    AGENT_TEAMS_ENABLED=true
+if [ "$AGENT_TEAMS_FOUND" = "false" ]; then
+  echo "⚠️  Agent Teams experimental flag not found in any config file or env var."
+  echo "    Set CLAUDE_CODE_EXPERIMENTAL_AGENT_TEAMS=1 in your environment or config."
+  echo "    Falling back to Subagents mode."
+  COORDINATION_MODE="subagents"
 fi
+```
 
-# Location 3: Global settings (~/.claude/settings.json)
-if grep -q "CLAUDE_CODE_EXPERIMENTAL_AGENT_TEAMS" ~/.claude/settings.json 2>/dev/null; then
-    AGENT_TEAMS_ENABLED=true
-fi
-
-# Location 4: Local settings (.claude/settings.local.json)
-if grep -q "CLAUDE_CODE_EXPERIMENTAL_AGENT_TEAMS" .claude/settings.local.json 2>/dev/null; then
-    AGENT_TEAMS_ENABLED=true
-fi
-
-if [ "$AGENT_TEAMS_ENABLED" = "false" ]; then
-    echo "⚠️  Agent Teams flag not found. Checked: env var, .claude/settings.json,"
-    echo "    ~/.claude/settings.json, .claude/settings.local.json."
-    echo "    Falling back to subagents mode."
-    echo ""
-    echo "    To enable Agent Teams, set the environment variable:"
-    echo "      export CLAUDE_CODE_EXPERIMENTAL_AGENT_TEAMS=1"
-    echo "    Or add it to .claude/settings.json."
-    COORDINATION_MODE="subagents"
-fi
-
-# Even if the flag is found, Agent Teams may fail at runtime if the feature
-# isn't available in the user's Claude Code version. If Agent Team spawning
-# fails during Phase 2, the orchestrator falls back to subagent mode for
-# that ticket (see Agent Team Timeout / Deadlock Handling → case 4).
+After mode selection, force a fresh ticket count from Linear to confirm sprint scope:
+```bash
+# Forced recount: verify ticket count matches expectations
+TICKET_COUNT=$(linear_list_issues team:${LINEAR_FILTER.team} label:${LINEAR_FILTER.label} status:${LINEAR_FILTER.status} | wc -l)
+echo "📊 Sprint scope: ${TICKET_COUNT} tickets queued in Linear."
+echo "   Coordination mode: ${COORDINATION_MODE}"
 ```
 
 ### Step 0G.5: Load Sprint Hints (from /tickets)
@@ -1123,26 +1113,18 @@ STATEEOF
 ```
 
 **Update this file at EVERY phase transition and after every ticket state change.**
+
+Valid `current_phase` values (in order):
+`"0-preflight"`, `"1-context"`, `"2-implementation"`, `"2.5-simplifier"`,
+`"3-verification"`, `"4-merge"`, `"4.5-integration"`, `"5-evidence"`,
+`"6-e2e"`, `"7-remaining"`, `"7.5-completeness"`, `"8-retrospective"`,
+`"complete"`, `"safety-stopped"`
+
 If context is compacted, the orchestrator reads this file to recover state.
 
-**Valid phase values** (update `phase` and `dashboard.current_phase` together):
-```
-"0-preflight"       — Phase 0: Pre-flight checks and setup
-"1-context"         — Phase 1: Context Agents analyzing codebase
-"2-implementation"  — Phase 2: Worker Agents implementing tickets
-"2.5-simplifier"    — Phase 2.5: Code Simplifier Agent running (between ticket batches)
-"3-verification"    — Phase 3: Verification + Code Review loop (per-ticket)
-"4-merge"           — Phase 4: Merge Executor integrating branches
-"4.5-integration"   — Phase 4.5: Post-merge integration check (build + test on base)
-"5-evidence"        — Phase 5: Evidence assembly and Linear posting
-"6-e2e"             — Phase 6: E2E browser testing
-"7-remaining"       — Phase 7: Remaining ticket check (loop)
-"8-retrospective"   — Phase 8: Post-sprint learning loop
-"complete"          — Sprint finished
-"safety-stopped"    — Sprint halted by safety mechanism
-```
-
 ### Step 0I: (Reserved — log moved to Step 0K after all user choices are made)
+
+**If ANY step fails → STOP and fix before proceeding.**
 
 ### Step 0J: Permission Mode Selection
 
@@ -1272,7 +1254,7 @@ Store the choice in sprint-state.json:
 
 ### Step 0K: Log Pre-Flight Results
 
-**This runs AFTER all user choices (coordination mode + permission mode) are made.**
+Now that ALL user choices are made (coordination mode + permission mode), log the complete summary:
 
 ```
 PRE-FLIGHT COMPLETE
@@ -1282,15 +1264,11 @@ PRE-FLIGHT COMPLETE
 ├── Snapshot: sprint-start-YYYYMMDD-HHMMSS ✓
 ├── Worktrees: .gitignore verified, stale cleaned ✓
 ├── progress.txt: Initialized ✓
-├── Failure patterns: {N} loaded ({M} high-frequency) ✓
-├── Problem statement: {loaded | not found} ✓
 ├── Coordination: {COORDINATION_MODE} ✓
 ├── sprint-state.json: Initialized ✓
-├── Permission mode: {PERMISSION_MODE} ✓
+├── Permission mode: {permission_mode} ✓
 └── Ready for Phase 1
 ```
-
-**If ANY step above failed → STOP and fix before proceeding.**
 
 ---
 
@@ -1752,29 +1730,27 @@ should match the pattern for "Edge Cases". Never require exact string equality.
 ## Testing Level Constraint (from /define problem statement)
 {IF PROBLEM_STATEMENT exists AND extract_section("Testing Strategy") is not empty:
   TESTING_LEVEL = extract "Level:" value from Testing Strategy section
-  # Inject the appropriate constraint based on the testing level:
+
   IF TESTING_LEVEL == "Full":
-    "Testing level: FULL. You MUST write:
-     - Unit tests for every new function (3+ cases: happy path, error, edge case)
-     - Integration tests for any API/service interactions
-     - Edge case tests for ALL edge cases listed in the ticket
-     E2E tests are handled separately in Phase 6 — do NOT write them here."
+    "Testing level: FULL — You MUST write unit tests, integration tests, AND E2E test
+     scenarios for this ticket. Every acceptance criterion needs at least one test.
+     Every edge case needs a dedicated test. Target >90% coverage for new code."
+
   ELIF TESTING_LEVEL == "Standard":
-    "Testing level: STANDARD. You MUST write:
-     - Unit tests for every new function (3+ cases)
-     - Integration tests for API/service interactions where applicable
-     - Edge case tests for edge cases listed in the ticket"
+    "Testing level: STANDARD — Write unit tests and integration tests matching existing
+     patterns. Every acceptance criterion needs at least one test. Edge cases should have
+     tests where the risk is non-trivial."
+
   ELIF TESTING_LEVEL == "Minimal":
-    "Testing level: MINIMAL. You MUST write:
-     - Unit tests for core logic functions only (happy path + 1 error case)
-     - Edge case tests ONLY for edge cases explicitly listed in the ticket
-     Skip integration tests unless the ticket specifically requires them."
+    "Testing level: MINIMAL — Write unit tests for core logic only. Focus on happy path
+     and critical edge cases. Integration tests optional unless the ticket is API-focused."
+
   ELIF TESTING_LEVEL == "Custom":
-    "Testing level: CUSTOM. Follow these specific test requirements:
-     {extract testing details from Testing Strategy section}"
+    CUSTOM_DETAILS = extract custom testing details from Testing Strategy section
+    "Testing level: CUSTOM — {CUSTOM_DETAILS}"
 }
-{IF PROBLEM_STATEMENT is null or Testing Strategy section is empty:
-  omit this section — default Worker workflow already requires tests
+{IF PROBLEM_STATEMENT does not exist OR Testing Strategy is empty:
+  "Testing level: STANDARD (default — no /define problem statement found)."
 }
 
 ## Project Standards
@@ -2037,12 +2013,6 @@ IF YOU ARE THE ORCHESTRATOR AND YOU ARE READING THIS AFTER AN AGENT TEAM COMPLET
 ---
 
 ## PHASE 2.5: CODE SIMPLIFIER (PER TICKET — BEFORE VERIFICATION)
-
-**NOTE ON PLACEMENT:** This section DEFINES the simplifier agent and its skip/run rules.
-The actual EXECUTION happens inside the Phase 3 verification loop as **Layer 1.5** (see Loop
-Logic). The simplifier runs exactly ONCE per ticket, on the first pass that clears Layer 1
-(evidence check), so that the simplified code gets verified in a single pass. Step 2C below
-contains the agent prompt. If you're looking for when it runs, see the loop logic at Layer 1.5.
 
 After each worker agent completes but BEFORE verification, optionally run the code-simplifier
 to clean up the worker's code. This uses the `code-simplifier` plugin agent (Opus)
@@ -2633,13 +2603,6 @@ while loop_count < MAX_LOOPS:
     # Verification Agent (mechanical) and Code Review Agent (quality) are INDEPENDENT.
     # Running them in parallel cuts verification time nearly in half for passing tickets.
     # Both are spawned simultaneously; we gate on "both pass" before Layer 4.
-    #
-    # PROCESSING ORDER (after both complete):
-    #   1. Check verification first (hard mechanical failures)
-    #   2. If verification fails → combine with any review issues → single Worker resume
-    #   3. If verification passes → check review (quality issues)
-    #   4. If both pass → proceed to Layer 2.5 (edge cases)
-    # This ensures we never send the Worker back twice for issues caught in parallel.
 
     verification, review = run IN PARALLEL:
         verification = run Verification Agent   # Layer 2: exit codes, test counts, config
@@ -2649,7 +2612,7 @@ while loop_count < MAX_LOOPS:
     VERIFICATION_RAW_OUTPUT = verification.RAW_TERMINAL_OUTPUT
     CODE_REVIEW_RAW_OUTPUT = review.RAW_OUTPUT
 
-    # ─── Process Layer 2 result (Verification) — checked FIRST ───
+    # ─── Process Layer 2 result (Verification) ───
     if verification.VERIFIED == false:
         current_error = classify_error(verification.failures)
         if current_error.type == last_error?.type:
@@ -2657,8 +2620,7 @@ while loop_count < MAX_LOOPS:
         else:
             consecutive_same_error = 1
         last_error = current_error
-        # COMBINE: If review also found issues, bundle them into one feedback message.
-        # This avoids a second round trip if the Worker fixes verification but not review.
+        # Include code review issues too (if any) to avoid another round trip
         combined_feedback = verification.failures
         if review.PASS == false:
             combined_feedback += "\n\nAlso, code review found: " + review.issues_summary
@@ -2708,15 +2670,22 @@ while loop_count < MAX_LOOPS:
             if no match found:
                 # Fallback 1: check if test description mentions the edge case
                 match = grep -rl "it\(.*{condition_keyword}" test_files
+
             if still no match:
                 # Fallback 2: Semantic search — the grep may miss synonyms or rephrased conditions.
-                # Search test files for the function name alone, then check surrounding context
-                # (±10 lines) for ANY of these semantic indicators:
-                #   - The condition_keyword itself
-                #   - Common synonyms: "empty" ↔ "blank" ↔ "missing", "null" ↔ "undefined" ↔ "nil"
-                #   - The expected behavior from the edge case description
-                # This catches cases like: edge case says "empty string" but test says "blank input"
-                semantic_matches = grep -l "{function_name}" test_files | xargs grep -B10 -A10 "{function_name}" | grep -iE "{condition_keyword}|{synonyms}|{expected_behavior_keyword}"
+                # Extract synonyms for the condition keyword and search more broadly.
+                synonyms = derive_synonyms(condition_keyword)
+                # e.g., "empty" → ["blank", "undefined", "null", "missing", "''"]
+                # e.g., "negative" → ["minus", "< 0", "below zero"]
+                semantic_matches = grep -rlE "(${function_name}|${condition_keyword}|$(join '|' synonyms))" test_files
+                if semantic_matches found:
+                    # Verify the match actually covers the edge case by checking context
+                    for matched_file in semantic_matches:
+                        context = grep -B5 -A10 "(${function_name}|${condition_keyword})" matched_file
+                        if context contains indication of edge case coverage:
+                            match = matched_file
+                            break
+
             if still no match after all fallbacks:
                 missing_edge_cases.append(edge_case)
 
@@ -3270,42 +3239,40 @@ produced conflicts in these files:
 RESOLUTION_REPORT:
   files_resolved: [{file, strategy_used}]
   acceptance_preserved:
-    ticket_a: {all criteria still met? YES/NO — explain which criteria and how verified}
-    ticket_b: {all criteria still met? YES/NO — explain which criteria and how verified}
-  evidence:
-    # FULL quality gate evidence for BOTH tickets (not just tests)
+    ticket_a: {all criteria still met? YES/NO}
+    ticket_b: {all criteria still met? YES/NO}
+  quality_gate_evidence:
     build:
       COMMAND: {BUILD_CMD}
       EXIT_CODE: {0 or non-zero}
       OUTPUT: |
-        {actual output — paste raw terminal output}
+        {raw terminal output — first 50 + last 20 lines if long}
     lint:
       COMMAND: {LINT_CMD}
       EXIT_CODE: {0 or non-zero}
       OUTPUT: |
-        {actual output}
+        {raw terminal output}
     typecheck:
       COMMAND: {TYPECHECK_CMD}
       EXIT_CODE: {0 or non-zero}
       OUTPUT: |
-        {actual output}
+        {raw terminal output}
     tests_ticket_a:
-      COMMAND: {TEST_CMD} --grep "{TICKET_A_PATTERN}"
+      COMMAND: {TEST_CMD} --grep "{TICKET_ID_A_PATTERN}"
       EXIT_CODE: {0 or non-zero}
       OUTPUT: |
-        {actual output}
+        {raw terminal output — must show test names + pass/fail}
     tests_ticket_b:
-      COMMAND: {TEST_CMD} --grep "{TICKET_B_PATTERN}"
+      COMMAND: {TEST_CMD} --grep "{TICKET_ID_B_PATTERN}"
       EXIT_CODE: {0 or non-zero}
       OUTPUT: |
-        {actual output}
+        {raw terminal output — must show test names + pass/fail}
     full_suite:
       COMMAND: {TEST_CMD}
       EXIT_CODE: {0 or non-zero}
       OUTPUT: |
-        {actual output}
-  VERDICT: ALL_PASS or PARTIAL_FAIL or FULL_FAIL
-  # ALL evidence must be raw terminal output. Claims without output are RULE 4 violations.
+        {summary line — e.g., "Tests: 142 passed, 0 failed"}
+  VERDICT: PASS (all green) or FAIL (any non-zero)
 
 Commit resolution: "merge: resolve conflicts for {TICKET_ID}"
 ```
@@ -3430,16 +3397,36 @@ session via `--session`, preventing the port collision issues of parallel Playwr
 # The ORCHESTRATOR starts a single dev server BEFORE spawning E2E agents.
 # This prevents N parallel agents from each trying to start their own server
 # (which causes EADDRINUSE port collisions).
-npm run dev &
+
+# ─── DEV SERVER PORT CONFIG ───
+# Detect port from project config, or use 3000 as default.
+DEV_PORT=${DEV_PORT:-$(grep -oP '"port"\s*:\s*\K\d+' package.json 2>/dev/null || echo "3000")}
+
+# Kill any existing process on the target port before starting
+existing_pid=$(lsof -ti :${DEV_PORT} 2>/dev/null)
+if [ -n "$existing_pid" ]; then
+  echo "⚠️  Port ${DEV_PORT} already in use (PID: ${existing_pid}). Killing..."
+  kill $existing_pid 2>/dev/null
+  sleep 1
+fi
+
+PORT=${DEV_PORT} npm run dev &
 DEV_PID=$!
 
 # Wait for the server to be ready
 for i in $(seq 1 30); do
-  curl -s http://localhost:3000/api/health >/dev/null 2>&1 && break
+  curl -s http://localhost:${DEV_PORT}/api/health >/dev/null 2>&1 && break
   sleep 1
 done
 
-# DEV_PID is passed to all E2E agents. Only the orchestrator kills it at the end.
+if ! curl -s http://localhost:${DEV_PORT}/api/health >/dev/null 2>&1; then
+  echo "❌ Dev server failed to start on port ${DEV_PORT} after 30s."
+  echo "   Check npm run dev output for errors."
+  kill $DEV_PID 2>/dev/null
+  # Fall back — skip E2E but don't fail the whole sprint
+fi
+
+# DEV_PID and DEV_PORT are passed to all E2E agents. Only the orchestrator kills it at the end.
 ```
 
 ### E2E Agent Setup
@@ -3641,14 +3628,11 @@ After E2E testing completes:
 iteration_count += 1
 
 # Query Linear for remaining tickets
-# NOTE: Combine the ORIGINAL LINEAR_FILTER.status values with "Todo" (always included).
-# E2E failures (Phase 6) create NEW tickets with status "Todo". If the original filter was
-# narrow (e.g., only "In Progress" for a resumed sprint), those new tickets would be missed.
-# We also preserve the original filter's statuses so that tickets in custom workflow states
-# (e.g., "Backlog", "Ready for Dev") aren't dropped.
+# ─── DYNAMIC STATUS FILTER ───
+# Build the status filter from the original LINEAR_FILTER.status PLUS "Todo".
+# This ensures E2E-created tickets (status "Todo") are always caught,
+# even if the original filter was narrow (e.g., only "In Progress" for resumed sprints).
 PHASE7_STATUSES = deduplicate(LINEAR_FILTER.status + ["Todo"])
-# Example: original filter ["In Progress"] → PHASE7_STATUSES = ["In Progress", "Todo"]
-# Example: original filter ["Todo", "In Progress"] → PHASE7_STATUSES = ["Todo", "In Progress"]
 remaining = fetch tickets from Linear where:
   team = {LINEAR_FILTER.team}
   label = {LINEAR_FILTER.label}
@@ -3669,72 +3653,70 @@ if iteration_count >= MAX_LOOP_ITERATIONS:
 
 ## PHASE 7.5: CROSS-TICKET FEATURE COMPLETENESS CHECK
 
-After all tickets are processed (remaining.length == 0) but BEFORE Phase 8,
-verify that the combined work actually delivers the feature described in `/define`.
-Individual tickets may all pass their own tests but still miss a cross-cutting concern.
+After all tickets complete (no remaining tickets in Phase 7), verify the sprint
+covered everything from the problem statement. This catches gaps that per-ticket
+verification misses — e.g., two tickets each implement half of a feature but
+neither fully delivers the implied requirement.
 
 ```
-# Only run if a problem statement exists
-if [ -f .claude/problem-statement.md ]; then
+{IF .claude/problem-statement.md exists:
 
-    success_criteria = extract_section("Success Criteria") from .claude/problem-statement.md
-    implied_features = extract_section("Implied Features") from .claude/problem-statement.md
-    user_journey = extract_section("User Journey") from .claude/problem-statement.md
+  # 1. Extract success criteria from problem statement
+  success_criteria = extract_section("Success Criteria")
+  implied_features = extract_section("Implied Features")
+  user_journey = extract_section("User Journey")
 
-    # For each success criterion, verify it was addressed by at least one completed ticket
-    UNMET_CRITERIA = []
-    for criterion in success_criteria:
-        # Extract 2-3 keywords from the criterion
-        keywords = extract_keywords(criterion)  # same algorithm as /tickets Approval Gate
-        # Search across ALL completed ticket branches (now merged into base)
-        matches = git log --all --oneline --grep="{keyword}" {BRANCH_BASE}..HEAD
-        # Also search the actual code changes
-        code_matches = git diff {SAFETY_TAG}..HEAD | grep -i "{keywords}"
-        if no matches found:
-            UNMET_CRITERIA.append(criterion)
+  # 2. Cross-reference against completed tickets
+  completed_tickets = sprint-state.json → all tickets with status "Done"
+  all_commits = gather commit messages from all completed ticket branches
 
-    # For each implied feature, verify it exists in the codebase
-    MISSING_FEATURES = []
-    for feature in implied_features:
-        keywords = extract_keywords(feature)
-        code_exists = grep -r "{keywords}" src/ app/ lib/ --include="*.ts" --include="*.tsx" --include="*.js" --include="*.jsx" 2>/dev/null
-        if no code_exists:
-            MISSING_FEATURES.append(feature)
+  # 3. Check each success criterion
+  unmet_criteria = []
+  for criterion in success_criteria:
+      # Search completed ticket descriptions + commit messages for evidence
+      evidence = grep -i "{criterion_keywords}" across ticket descriptions + commits
+      if no evidence found:
+          unmet_criteria.append(criterion)
 
-    if UNMET_CRITERIA is not empty OR MISSING_FEATURES is not empty:
-        LOG WARNING: "FEATURE COMPLETENESS GAP DETECTED"
-        LOG: "  Unmet success criteria: {UNMET_CRITERIA}"
-        LOG: "  Missing implied features: {MISSING_FEATURES}"
+  # 4. Check each implied feature
+  undelivered_features = []
+  for feature in implied_features:
+      evidence = grep -i "{feature_keywords}" across ticket descriptions + commits
+      if no evidence found:
+          undelivered_features.append(feature)
 
-        # Present to user for decision
-        Present:
-          "## Feature Completeness Check"
-          "The sprint completed all tickets, but these items from the problem statement"
-          "may not be fully addressed:"
-          ""
-          "### Unmet Success Criteria:"
-          {list UNMET_CRITERIA or "None — all criteria appear covered"}
-          ""
-          "### Missing Implied Features:"
-          {list MISSING_FEATURES or "None — all implied features appear present"}
-          ""
-          "Options:"
-          "  [1] Create follow-up tickets — generate new tickets for gaps"
-          "  [2] Ignore — these are false positives or out of scope"
-          "  [3] Manual review — I'll check these myself"
+  # 5. Verify user journey step coverage
+  uncovered_steps = []
+  for step in user_journey:
+      # Check if any ticket's acceptance criteria cover this step
+      if no ticket covers this step:
+          uncovered_steps.append(step)
 
-        if user selects [1]:
-            # Create new tickets in Linear for each gap
-            for gap in (UNMET_CRITERIA + MISSING_FEATURES):
-                create_ticket(title="Complete: {gap}", description="...", priority=3)
-            → Go to PHASE 2 with new tickets
+  # 6. Report and act
+  if unmet_criteria or undelivered_features or uncovered_steps:
+      echo "⚠️  COMPLETENESS GAPS DETECTED"
+      echo "  Unmet success criteria: {unmet_criteria}"
+      echo "  Undelivered implied features: {undelivered_features}"
+      echo "  Uncovered user journey steps: {uncovered_steps}"
+      echo ""
+      echo "Options:"
+      echo "  [1] Create follow-up tickets in Linear for gaps"
+      echo "  [2] Ignore — these are out of scope for this sprint"
+      echo "  [3] Manual review — I'll check these myself"
 
-    else:
-        LOG: "Feature completeness check PASSED — all success criteria and implied features covered."
+      # If user chooses [1]:
+      # Create tickets with label "sprint-followup" and reference the problem statement
+  else:
+      echo "✅ All success criteria, implied features, and user journey steps covered."
+  fi
 
-fi
-# If no problem statement, skip this phase silently
+ELSE:
+  echo "No problem statement found — skipping completeness check."
+  echo "Tip: Run /define before /tickets to enable cross-ticket completeness verification."
+}
 ```
+
+Update sprint-state.json: `current_phase = "7.5-completeness"`
 
 ---
 
@@ -3814,40 +3796,30 @@ Analyze what happened and extract learnings for future sprints.
 {READ .claude/sprint-state.json}
 {READ .claude/sprint-dashboard.md}
 {READ progress.txt}
-{IF exists .claude/problem-statement.md: READ .claude/problem-statement.md}
 
 ## Analysis Required
 
-### 0. Problem Statement Comparison (if available)
-{IF .claude/problem-statement.md was loaded:
-  Compare the sprint's final state against the original problem statement:
+### 0. Problem Statement Comparison
+{IF .claude/problem-statement.md exists:
+  READ .claude/problem-statement.md
 
-  a. USER JOURNEY COVERAGE: For each step in the "User Journey" section,
-     determine if the sprint produced code that implements that step.
-     Check git diff {SAFETY_TAG}..HEAD for evidence of each journey step.
-     Rate: FULLY_COVERED | PARTIALLY_COVERED | NOT_COVERED
+  Compare the sprint's actual outcomes against the problem statement:
+  a) USER JOURNEY COVERAGE: For each step in the User Journey section,
+     did any completed ticket implement this step? Rate: COVERED / PARTIAL / MISSING.
+  b) SUCCESS CRITERIA SATISFACTION: For each success criterion,
+     is there evidence in the completed tickets that it was met?
+     Rate: MET / PARTIALLY MET / NOT MET.
+  c) IMPLIED FEATURES DELIVERY: For each implied feature,
+     was it implemented in any ticket? Rate: DELIVERED / PARTIAL / NOT DELIVERED.
 
-  b. SUCCESS CRITERIA SATISFACTION: For each criterion in "Success Criteria",
-     check if at least one completed ticket addressed it. Cross-reference
-     sprint-state.json ticket descriptions with criteria keywords.
-     Rate: MET | PARTIALLY_MET | NOT_MET
-
-  c. IMPLIED FEATURES DELIVERY: For each item in "Implied Features",
-     verify the feature exists in the codebase.
-     Rate: DELIVERED | MISSING
-
-  d. OVERALL VERDICT: Did we solve the original problem?
-     - GREEN: All user journey steps covered, all success criteria met
-     - YELLOW: Some gaps but core problem is solved
-     - RED: Original problem not fully addressed
-
-  Include this in the RETROSPECTIVE_REPORT as a new section:
-  ### Problem Statement Alignment:
-    user_journey_coverage: {list of steps with ratings}
-    success_criteria_satisfaction: {list of criteria with ratings}
-    implied_features_delivery: {list of features with ratings}
-    overall_verdict: {GREEN/YELLOW/RED}
-    gaps_identified: {list of any NOT_COVERED/NOT_MET/MISSING items}
+  Produce a verdict:
+    GREEN  = All user journey steps covered, all success criteria met, all implied features delivered
+    YELLOW = Minor gaps (1-2 partially met criteria or partially delivered features)
+    RED    = Significant gaps (missing user journey steps or unmet success criteria)
+}
+{IF .claude/problem-statement.md does not exist:
+  "No problem statement available — skipping alignment check.
+   Tip: Run /define → /tickets → /sprint for full traceability."
 }
 
 ### 1. Ticket Analysis
@@ -3932,8 +3904,24 @@ After the retrospective agent returns:
            last_seen: sprint_id
            tickets_affected: [TICKET_ID]
 
-   Write updated .claude/failure-patterns.json
-   LOG: "Failure patterns updated: {N} new, {M} updated"
+   # ─── DEDUP BEFORE WRITE ───
+   # Failure patterns can accumulate near-duplicates across sprints.
+   # Before writing, merge patterns that share the same (error_type, module, pattern):
+   dedup_patterns = []
+   for p in all_patterns:
+       match = find in dedup_patterns where (p.error_type == match.error_type AND
+                                              p.module == match.module AND
+                                              similarity(p.pattern, match.pattern) > 0.85)
+       if match:
+           match.frequency += p.frequency
+           match.tickets_affected = union(match.tickets_affected, p.tickets_affected)
+           match.last_seen = max(match.last_seen, p.last_seen)
+           match.resolution = p.resolution if p.last_seen > match.last_seen else match.resolution
+       else:
+           dedup_patterns.append(p)
+
+   Write dedup_patterns to .claude/failure-patterns.json
+   LOG: "Failure patterns updated: {N} new, {M} updated, {D} deduplicated"
 
 5. Save full retrospective to .claude/sprint-history/{sprint_id}.md
 
@@ -4084,12 +4072,10 @@ git branch --list "worktree-*" | while read branch; do
 done
 
 # 4. Kill any lingering dev server from Phase 6
-# The orchestrator starts a dev server in Pre-Phase 6 and should kill it in Post-Phase 6,
-# but if the sprint safety-stopped during E2E testing, DEV_PID may still be alive.
 if [ -n "$DEV_PID" ]; then
   kill $DEV_PID 2>/dev/null && echo "Killed lingering dev server (PID: $DEV_PID)"
 fi
-# Also kill any orphaned dev servers on the standard ports
+# Also scan common dev server ports for orphaned processes
 for port in 3000 3001 5173 8080; do
   pid=$(lsof -ti :$port 2>/dev/null)
   if [ -n "$pid" ]; then
@@ -4106,7 +4092,7 @@ if [ -f .claude/sprint-state.json ]; then
   rm .claude/sprint-state.json
 fi
 
-# 6. Final status
+# 5. Final status
 git worktree list
 echo "Cleanup complete."
 ```
@@ -4129,12 +4115,10 @@ echo "Cleanup complete."
     [ ] Safety snapshot tagged
     [ ] .claude/worktrees/ in .gitignore
     [ ] Stale worktrees cleaned
-    [ ] progress.txt initialized (or pruned if Completed Tickets > 200 lines)
+    [ ] progress.txt initialized
     [ ] Failure pattern database loaded (.claude/failure-patterns.json)
     [ ] High-frequency patterns logged (if any ≥3 occurrences)
     [ ] Problem statement loaded (if .claude/problem-statement.md exists from /define)
-    [ ] Problem statement schema validated (schema_version ≥ 2)
-    [ ] Problem statement staleness checked (generated_commit vs HEAD)
     [ ] User journey steps extracted for Phase 6 E2E scenarios
     [ ] Success criteria extracted for Layer 4 Completion Agent
     [ ] Coordination mode chosen (Subagents or Agent Teams)
@@ -4243,16 +4227,9 @@ echo "Cleanup complete."
     [ ] No tickets remain (or safety cap reached)
     [ ] Fix-up loop iterations: {N}/{MAX_LOOP_ITERATIONS}
 
-[ ] Phase 7.5: Cross-ticket feature completeness check
-    [ ] Problem statement success criteria compared against completed work
-    [ ] Implied features verified in codebase
-    [ ] Gaps presented to user (if any) with follow-up options
-    [ ] (Skipped if no problem statement exists)
-
 [ ] Phase 8: Post-Sprint Learning Loop
-    [ ] Retrospective Agent analyzed sprint-state.json + dashboard + progress.txt + problem-statement.md
-    [ ] Problem statement alignment assessed (user journey coverage, criteria satisfaction, implied features)
-    [ ] RETROSPECTIVE_REPORT generated (what worked, what failed, patterns, problem alignment)
+    [ ] Retrospective Agent analyzed sprint-state.json + dashboard + progress.txt
+    [ ] RETROSPECTIVE_REPORT generated (what worked, what failed, patterns)
     [ ] progress.txt updated with sprint learnings
     [ ] Failure pattern database updated (.claude/failure-patterns.json — new + updated patterns)
     [ ] CLAUDE.md suggestions presented to user (applied only with approval)
@@ -4262,7 +4239,6 @@ echo "Cleanup complete."
 [ ] Sprint cleanup
     [ ] All worktrees removed
     [ ] Stale branches pruned
-    [ ] Lingering dev servers killed (DEV_PID + orphaned port processes)
     [ ] Sprint dashboard finalized (final status)
     [ ] sprint-state.json archived
     [ ] Sprint summary logged

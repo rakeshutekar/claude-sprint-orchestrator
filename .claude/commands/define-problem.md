@@ -2,6 +2,7 @@
 description: Define the problem statement, success criteria, and testing strategy through a structured dialogue. Produces .claude/problem-statement.md for /tickets and /sprint.
 ---
 
+
 # /define — From Idea to Problem Statement
 
 You are a **problem definition facilitator**. Your job is to have a focused 3-5 minute
@@ -45,13 +46,14 @@ ls test* 2>/dev/null       # Test directories
 # 3. Check for project standards
 #    Read CLAUDE.md or README.md (first 50 lines) if they exist
 
-# 4. Detect test infrastructure and count existing tests
+# 4. Detect test infrastructure
 #    Look for: vitest.config.ts, jest.config.js, playwright.config.ts, cypress.config.ts
 #    Check package.json scripts for test commands
-#    Count existing tests (approximate — just a ballpark):
-#      Unit/integration: grep -r "it(\|test(\|describe(" --include="*.test.*" --include="*.spec.*" -l 2>/dev/null | wc -l
-#      E2E: find . -path "*/e2e/*.test.*" -o -path "*/e2e/*.spec.*" 2>/dev/null | wc -l
-#    Store as: "{N} unit/integration test files, {M} e2e test files"
+#
+#    COUNT existing tests (don't just detect framework — count actual test files):
+#    unit_test_count=$(find . -name "*.test.*" -o -name "*.spec.*" | grep -v node_modules | wc -l)
+#    e2e_test_count=$(find . -path "*/e2e/*.test.*" -o -path "*/e2e/*.spec.*" | wc -l)
+#    Record: "~{unit_test_count} unit test files, ~{e2e_test_count} e2e test files"
 
 # 5. Check for existing database/auth/API patterns
 #    Look for: prisma/schema.prisma, drizzle.config.ts, .env.example,
@@ -73,7 +75,7 @@ CODEBASE_CONTEXT = {
   has_db: true,
   has_api: true,
   key_dirs: ["src/services/", "src/components/", "prisma/"],
-  existing_test_count: "{N} unit/integration test files, {M} e2e test files",  # from grep count
+  existing_test_count: "~150 unit tests, 0 e2e tests",
   project_description: "{from CLAUDE.md or README, 1-2 sentences}"
 }
 ```
@@ -267,8 +269,8 @@ After all questions are answered, generate the structured problem statement.
 
 schema_version: 2
 generated_at: {ISO_TIMESTAMP}
-generated_commit: {current git HEAD SHA — run `git rev-parse HEAD`}
-codebase: {CODEBASE_CONTEXT.stack}
+generated_commit: {$(git rev-parse HEAD)}
+Codebase: {CODEBASE_CONTEXT.stack}
 
 ---
 
@@ -370,21 +372,19 @@ codebase: {CODEBASE_CONTEXT.stack}
 - Has API layer: {yes/no}
 ```
 
-### Post-Write: Gitignore the Problem Statement
+### Post-Write: Gitignore Execution
 
-After writing `.claude/problem-statement.md`, ensure it's gitignored (it's a runtime planning
-file, not source code — same pattern as sprint-state.json and sprint-hints.json):
+After writing `.claude/problem-statement.md`, ensure it is gitignored:
 
 ```bash
-# Ensure .claude/problem-statement.md is in .gitignore
-git check-ignore -q .claude/problem-statement.md 2>/dev/null || echo ".claude/problem-statement.md" >> .gitignore
-
-# Commit gitignore change if needed
-if ! git diff --quiet .gitignore 2>/dev/null; then
-  git add .gitignore
-  git commit -m "chore: gitignore problem statement (runtime planning file)"
+# Add to .gitignore if not already present
+if ! grep -q "problem-statement.md" .gitignore 2>/dev/null; then
+  echo ".claude/problem-statement.md" >> .gitignore
+  echo "Added .claude/problem-statement.md to .gitignore"
 fi
 ```
+
+This is NOT optional. Execute the above commands — do NOT just document that it should be done.
 
 ---
 
@@ -414,12 +414,14 @@ Options:
 
 **If user chooses [1]:**
 ```
-echo "✅ Problem statement saved. To continue, copy and run:"
+echo "Launching /tickets with your problem statement as context..."
+echo "Tip: /tickets will automatically read .claude/problem-statement.md"
 echo ""
-echo "   /tickets {one-line summary of the problem}"
+echo "Copy and run this command:"
 echo ""
-echo "/tickets will automatically detect and load .claude/problem-statement.md"
-echo "(Slash commands cannot chain automatically — you need to invoke /tickets yourself.)"
+echo '  /tickets "{one-line summary of the problem}"'
+echo ""
+echo "(You must run this yourself — /define cannot invoke /tickets directly.)"
 ```
 
 **If user chooses [2]:**
@@ -465,9 +467,8 @@ RULE 6: SAVE EVERYTHING
   to read it without needing any context from this conversation.
 
 RULE 7: GITIGNORE THE PROBLEM STATEMENT
-  The Post-Write step in Phase 2 handles this automatically using `git check-ignore`.
-  If for any reason it was skipped, /tickets and /sprint also have their own gitignore
-  steps as a safety net.
+  Add .claude/problem-statement.md to .gitignore — it's a runtime planning file,
+  not code. (Same pattern as sprint-state.json and sprint-hints.json.)
 ```
 
 ---
@@ -476,13 +477,8 @@ RULE 7: GITIGNORE THE PROBLEM STATEMENT
 
 ### What /define produces:
 ```
-.claude/problem-statement.md    # The structured problem statement (schema_version: 2)
+.claude/problem-statement.md    # The structured problem statement
 ```
-
-### Schema Fields (header block):
-- `schema_version`: Integer — consumers validate against this to detect format changes
-- `generated_at`: ISO-8601 timestamp — used for staleness checks
-- `generated_commit`: Git HEAD SHA when /define ran — used for codebase drift detection
 
 ### What /tickets reads from it:
 - Problem description → becomes the FEATURE context (richer than a one-liner)
@@ -518,8 +514,8 @@ RULE 7: GITIGNORE THE PROBLEM STATEMENT
     [ ] Q5-Q7: Conditional follow-ups asked (if relevant)
 
 [ ] Phase 2: Problem statement generated
-    [ ] .claude/problem-statement.md written (with schema_version, generated_at, generated_commit header)
-    [ ] Post-Write: git check-ignore verified, .gitignore updated if needed
+    [ ] .claude/problem-statement.md written
+    [ ] .claude/problem-statement.md added to .gitignore
     [ ] All sections populated
     [ ] User journey → success criteria mapping complete
     [ ] User journey → test scenarios mapping complete
