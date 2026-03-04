@@ -243,7 +243,8 @@ The execution command. Fetches tickets from Linear, deploys Agent Teams per tick
 
 1. **Context pre-flight** — Estimates remaining context window. If <60%, prompts user: Compact+Continue (saves state to `sprint-preflight.json`, compacts, resumes), Proceed as-is, or Cancel. Invisible when context is healthy.
 2. **Pre-flight** — Validates Linear MCP, git state, baseline build. Loads sprint hints from /tickets (if available) for stale plan detection. Loads failure pattern database from previous sprints. User chooses coordination mode (Agent Teams recommended, Subagents fallback). Initializes sprint-state.json checkpoints
-3. **Fetch tickets** — Queries Linear for matching tickets
+3. **Permission mode** — Prompts user to choose how to handle permission prompts: auto-approve sprint commands (recommended, generates allowedTools config), skip all permissions (autonomous mode), manual approval, or skip if pre-configured
+4. **Fetch tickets** — Queries Linear for matching tickets
 4. **Deploy Agent Teams** — Per ticket: orchestrator (team lead) spawns Context Agent (Sonnet) + Worker Agent (Opus) as teammates in a shared worktree. Context Agents write warm-start skeleton templates (imports, signatures, test scaffolding). Workers fill in business logic. Smart worktree strategy: dependency-aware branching pre-merges dep code for dependent tickets.
 5. **Code simplifier** — Conditional refine pass (skipped in Agent Teams with clean code, for bug fixes, or small tickets). Auto-reverts if it breaks tests.
 6. **Multi-layer verification loop** — Stale base check → Worker preflight validation → Context exhaustion detection → Evidence check → Parallel verification (Layers 2+3 run concurrently: mechanical verification + code review) → Edge case verification → Circuit breaker → Human review (optional) → Completion verdict → Orchestrator assembles raw proof and posts to Linear → Orchestrator marks Done and verifies. Cross-ticket learnings from completed tickets are fed into subsequent Workers.
@@ -271,6 +272,14 @@ The execution command. Fetches tickets from Linear, deploys Agent Teams per tick
 │  Load failure patterns + sprint hints                               │
 │  Choose coordination mode (Agent Teams recommended)                 │
 │  Initialize sprint-state.json (checkpoint system)                    │
+└───────────────────────────────┬─────────────────────────────────────┘
+                                │
+                                ▼
+┌─────────────────────────────────────────────────────────────────────┐
+│                 STEP 0J: PERMISSION MODE SELECTION                   │
+│  [Auto-approve / Skip all / Manual / Pre-configured]                │
+│  Auto-approve: generates allowedTools config from sprint commands    │
+│  Skip all: verifies --dangerously-skip-permissions flag             │
 └───────────────────────────────┬─────────────────────────────────────┘
                                 │
                                 ▼
@@ -410,6 +419,7 @@ The execution command. Fetches tickets from Linear, deploys Agent Teams per tick
 ### Key Features
 
 - **Context pre-flight check** — Estimates remaining context before sprint start. If <60%, prompts user: Compact+Continue (saves all parsed state to `sprint-preflight.json`, compacts, reloads seamlessly), Proceed as-is, or Cancel. Invisible when context is healthy.
+- **Permission mode selection** — Before spawning agents, prompts user to choose: auto-approve sprint commands (generates precise `allowedTools` config from your BUILD_CMD/LINT_CMD/TEST_CMD), skip all permissions (`--dangerously-skip-permissions`), manual approval, or skip if already configured. Eliminates hundreds of "Allow?" prompts during sprint execution.
 - **Agent Teams per ticket** — Context Agent (Sonnet) + Worker Agent (Opus) as live teammates in a shared worktree. The Worker asks follow-up questions, the Context Agent reads files on demand. No lossy context handoff. Agent Teams are restricted from touching Linear, only the independent verification chain handles ticket status.
 - **Warm-start skeleton templates** — Context Agents write actual skeleton files (correct imports, function signatures, type definitions, test scaffolding) in the worktree. Workers fill in business logic instead of starting from blank files.
 - **Smart worktree strategy** — Dependency-aware branching: dependent tickets get worktrees with dependency code pre-merged. Wave-based deployment order ensures deps complete before dependents.

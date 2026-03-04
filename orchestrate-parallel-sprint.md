@@ -131,6 +131,15 @@ echo ".claude/worktrees/" >> .gitignore && git add .gitignore && git commit -m "
                                 │
                                 ▼
 ┌─────────────────────────────────────────────────────────────────────┐
+│                 STEP 0J: PERMISSION MODE SELECTION                   │
+│  Prompt user: [Auto-approve / Skip all / Manual / Pre-configured]   │
+│  Auto-approve: display allowedTools config for sprint commands       │
+│  Skip all: verify --dangerously-skip-permissions flag                │
+│  Manual: proceed with default prompts (Shift+Tab tip)               │
+└───────────────────────────────┬─────────────────────────────────────┘
+                                │
+                                ▼
+┌─────────────────────────────────────────────────────────────────────┐
 │                    PHASE 1: FETCH TICKETS                           │
 │  Query Linear for all tickets matching LINEAR_FILTER                │
 │  Store: [{id, title, description, priority, labels}]                │
@@ -986,10 +995,137 @@ PRE-FLIGHT COMPLETE
 ├── progress.txt: Initialized ✓
 ├── Coordination: {COORDINATION_MODE} ✓
 ├── sprint-state.json: Initialized ✓
+├── Permission mode: {permission_mode} ✓
 └── Ready for Phase 1
 ```
 
 **If ANY step fails → STOP and fix before proceeding.**
+
+### Step 0J: Permission Mode Selection
+
+Before spawning agents, ask the user how they want to handle permission prompts.
+A full sprint generates hundreds of tool calls (bash commands, file edits, git operations)
+across dozens of agents. Without pre-configuration, the user will face constant
+"Allow?" prompts that make the sprint impractical to run.
+
+**Present this prompt:**
+```
+═══════════════════════════════════════════════════════════════
+🔐 PERMISSION MODE
+═══════════════════════════════════════════════════════════════
+
+Your sprint is configured with these commands:
+  Build:     {BUILD_CMD}
+  Lint:      {LINT_CMD}
+  Test:      {TEST_CMD}
+  Typecheck: {TYPECHECK_CMD or "not configured"}
+  E2E:       {E2E_CMD or "not configured"}
+
+A {N}-ticket sprint will spawn ~{N*8} agent context windows,
+each running multiple bash commands. Without permission config,
+you'll face hundreds of "Allow?" prompts.
+
+Options:
+  [1] Auto-approve sprint commands (Recommended)
+      Adds your sprint commands to allowedTools. You'll only be
+      prompted for unexpected commands. Safe and practical.
+
+  [2] Skip all permissions (--dangerously-skip-permissions)
+      Full autonomous mode. No prompts at all. Fastest, but
+      agents can run ANY command without approval.
+      Only recommended in isolated environments (Docker/VM).
+
+  [3] Manual approval
+      Default permission behavior. You approve every command.
+      Only practical for very small sprints (1-2 tickets).
+
+  [4] I've already configured permissions — skip this step
+
+Choose [1/2/3/4]:
+═══════════════════════════════════════════════════════════════
+```
+
+**If user chooses [1] — Auto-approve sprint commands:**
+
+Display the exact `allowedTools` configuration for their `.claude/settings.json`:
+
+```
+To auto-approve sprint commands, add these to your
+.claude/settings.json under "allow":
+
+{
+  "permissions": {
+    "allow": [
+      "Edit",
+      "MultiEdit",
+      "Write",
+      "Bash(npm run build)",
+      "Bash(npm run lint)",
+      "Bash(npm run test:run)",
+      "Bash(npx tsc --noEmit)",
+      "Bash(git *)",
+      "Bash(mkdir *)",
+      "Bash(cp *)",
+      "Bash(agent-browser *)",
+      "Bash(curl -sf http://localhost*)"
+    ]
+  }
+}
+
+NOTE: These patterns are derived from YOUR sprint config.
+Only the commands you configured above will be auto-approved.
+```
+
+Then ask: "Have you added these to your settings? [yes/skip]"
+
+If "yes" → proceed to Phase 1.
+If "skip" → proceed with manual permissions (user's choice).
+
+**Important:** The orchestrator does NOT modify `.claude/settings.json` itself.
+Modifying security settings programmatically is a boundary the orchestrator must not cross.
+The user copies the config manually so they own the decision.
+
+**If user chooses [2] — Skip all permissions:**
+
+```
+⚠️  You've chosen to skip all permissions. This means agents can run
+ANY command without approval, including potentially destructive operations.
+
+To enable this, start Claude Code with:
+  claude --dangerously-skip-permissions
+
+If you're already in a session, you'll need to restart with this flag.
+Are you running with --dangerously-skip-permissions? [yes/no]
+```
+
+If "yes" → proceed to Phase 1.
+If "no" → tell user to restart with the flag, then re-run `/sprint`.
+
+**Safety net for option 2:** Even with permissions skipped, the orchestrator's
+own rules still prevent destructive actions (Rule 10: no force pushes,
+Rule 18: no git reset --hard on main). These are prompt-level guardrails
+that don't depend on the permission system.
+
+**If user chooses [3] — Manual approval:**
+
+```
+ℹ️  Manual approval mode. You'll be prompted for each command.
+    Tip: Press Shift+Tab during the sprint to toggle auto-accept edits on/off.
+    This at least eliminates file edit prompts while keeping bash prompts.
+
+Proceeding to Phase 1...
+```
+
+**If user chooses [4] — Already configured:**
+
+```
+✅ Skipping permission setup. Proceeding to Phase 1...
+```
+
+Store the choice in sprint-state.json:
+```json
+"permission_mode": "{auto-approve|skip-all|manual|pre-configured}"
+```
 
 ---
 
@@ -3638,6 +3774,10 @@ echo "Cleanup complete."
     [ ] INTRA_SPRINT_LEARNINGS buffer initialized (empty)
     [ ] Sprint dashboard created (.claude/sprint-dashboard.md)
     [ ] Pre-flight log includes coordination mode + sprint-state status
+    [ ] Permission mode selected (auto-approve / skip-all / manual / pre-configured)
+    [ ] If auto-approve: allowedTools config displayed, user confirmed
+    [ ] If skip-all: --dangerously-skip-permissions flag verified
+    [ ] Permission mode stored in sprint-state.json
 
 [ ] Phase 1: Tickets fetched
     [ ] {N} tickets loaded from Linear
