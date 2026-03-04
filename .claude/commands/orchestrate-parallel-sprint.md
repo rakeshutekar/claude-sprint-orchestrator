@@ -19,7 +19,8 @@ BUILD_CMD: "npm run build"              # Build command
 LINT_CMD: "npm run lint"                # Lint command
 TEST_CMD: "npm run test:run"            # Unit test command
 TYPECHECK_CMD: "npx tsc --noEmit"      # Type check command (optional)
-E2E_CMD: "npx playwright test"          # E2E test command (optional)
+E2E_CMD: "npx playwright test"          # Existing E2E test runner (optional, used in Phase 6 Step 2)
+                                        # Phase 6 Step 3 uses agent-browser CLI for primary browser verification
 COMMIT_PREFIX: "feat"                   # Conventional commit prefix
 MAX_LOOP_ITERATIONS: 3                  # Safety cap on fix-up loops
 HUMAN_IN_LOOP: false                    # true = pause for human review before marking Done
@@ -113,10 +114,28 @@ echo ".claude/worktrees/" >> .gitignore && git add .gitignore && git commit -m "
 
 ```
 ┌─────────────────────────────────────────────────────────────────────┐
+│                  STEP 0-PRE: CONTEXT PRE-FLIGHT                     │
+│  Estimate remaining context window                                  │
+│  If <60%: prompt user → [Compact+Continue / Proceed / Cancel]       │
+│  Compact: save state to sprint-preflight.json → compact → reload    │
+│  If ≥60%: skip silently                                             │
+└───────────────────────────────┬─────────────────────────────────────┘
+                                │
+                                ▼
+┌─────────────────────────────────────────────────────────────────────┐
 │                        PHASE 0: PRE-FLIGHT                          │
 │  Check Linear → Pull base → Build baseline → Tag snapshot           │
 │  Choose coordination mode (Subagents vs Agent Teams)                │
 │  Initialize sprint-state.json (checkpoint system)                    │
+└───────────────────────────────┬─────────────────────────────────────┘
+                                │
+                                ▼
+┌─────────────────────────────────────────────────────────────────────┐
+│                 STEP 0J: PERMISSION MODE SELECTION                   │
+│  Prompt user: [Auto-approve / Skip all / Manual / Pre-configured]   │
+│  Auto-approve: display allowedTools config for sprint commands       │
+│  Skip all: verify --dangerously-skip-permissions flag                │
+│  Manual: proceed with default prompts (Shift+Tab tip)               │
 └───────────────────────────────┬─────────────────────────────────────┘
                                 │
                                 ▼
@@ -269,14 +288,17 @@ echo ".claude/worktrees/" >> .gitignore && git add .gitignore && git commit -m "
                                 │
                                 ▼
 ┌─────────────────────────────────────────────────────────────────────┐
-│         PHASE 6: E2E BEHAVIORAL VERIFICATION (PARALLEL)             │
+│     PHASE 6: E2E BEHAVIORAL VERIFICATION (agent-browser, PARALLEL)  │
 │                                                                     │
-│  One E2E agent per ticket:                                          │
-│  • Run E2E test suite for this feature                              │
-│  • Start dev server → hit real endpoints → verify responses         │
-│  • Check DB state, logs, integration points                         │
-│  Failure → report to orchestrator (it creates Linear tickets)       │
+│  Orchestrator starts ONE shared dev server (Pre-Phase 6)            │
+│  One E2E agent per ticket (--session {TICKET_ID} for isolation):    │
+│  • Step 1: Verify dev server responsive (curl health check)         │
+│  • Step 2: Run existing E2E tests (E2E_CMD) if configured           │
+│  • Step 3: agent-browser snapshot → interact → verify behaviors     │
+│  • Step 4: Collect evidence (screenshots, snapshots, assertions)    │
+│  Failure → report to orchestrator (creates Linear tickets)          │
 │  Success → E2E_PASS with behavioral evidence                        │
+│  Orchestrator kills dev server (Post-Phase 6)                       │
 └───────────────────────────────┬─────────────────────────────────────┘
                                 │
                                 ▼
@@ -467,6 +489,230 @@ With the buffer, Ticket B's Worker reads the learning and avoids the error entir
 
 Before spawning any agents, run these checks SEQUENTIALLY. Stop on first failure.
 
+### Step 0-Pre: Context Pre-Flight Check
+
+**This MUST run before anything else.** Estimate the remaining context window and prompt
+the user if it's too low to safely run a full sprint.
+
+**How to estimate context usage:**
+
+**HONEST CAVEAT:** There is no reliable API to measure remaining context. These heuristics are
+approximate — err on the side of compacting. A false positive (compacting when unnecessary)
+costs ~30 seconds. A false negative (running out mid-sprint) costs the entire sprint.
+
+```bash
+# Heuristic: count approximate tokens in the current conversation
+# Claude's context window is ~200K tokens. We want ≥60% remaining (~120K tokens free).
+# Check conversation length, compaction history, and loaded context as signals.
+
+# Signal 1: Has a compaction already happened in this session?
+#   If yes → we've already lost context. Yellow/Red zone likely. Recommend compacting.
+# Signal 2: How much content preceded the /sprint invocation?
+#   If /define + /tickets ran in this session → likely 40-60% consumed already.
+#   If /sprint is the first command → likely 90%+ remaining.
+# Signal 3: Can you recall the FULL config block and all orchestrator rules without re-reading?
+#   If anything feels fuzzy → context is degraded.
+# Signal 4: Is the conversation transcript long? (rough heuristic: >50 user messages = yellow)
+
+# DECISION RULE: If Signal 1 is true OR Signal 2 suggests heavy prior usage → prompt user.
+# When in doubt, prompt. The preflight checkpoint makes compaction nearly free.
+```
+
+**Threshold: 60% remaining context.**
+
+If the orchestrator estimates it has **less than 60% context remaining**, present this prompt
+to the user (similar to how /plan asks for approval):
+
+```
+═══════════════════════════════════════════════════════════════
+⚠️  CONTEXT PRE-FLIGHT CHECK
+═══════════════════════════════════════════════════════════════
+
+Estimated context remaining: ~{X}%
+A full sprint typically requires ≥60% to avoid mid-sprint degradation
+(agent spawning, verification loops, and merge scheduling are context-heavy).
+
+Options:
+  [1] Compact and continue — Save all state to disk, compact, then resume sprint
+  [2] Proceed as-is — I understand the risk (small sprints may be fine)
+  [3] Cancel — I'll start a fresh session instead
+
+Choose [1/2/3]:
+═══════════════════════════════════════════════════════════════
+```
+
+**If user chooses [1] — Compact and Continue:**
+
+Before compacting, the orchestrator MUST dump ALL parsed state to `.claude/sprint-preflight.json`.
+This file is the checkpoint that makes compaction lossless.
+
+```bash
+# 1. Run Step 0A through 0F.5 FIRST (parse everything before saving)
+#    This ensures we have all config, hints, failure patterns, etc. loaded
+
+# 2. Write sprint-preflight.json with everything parsed so far
+cat > .claude/sprint-preflight.json << 'PREFLIGHTEOF'
+{
+  "version": 1,
+  "created_at": "{ISO-8601 timestamp}",
+  "created_by": "sprint-preflight",
+  "expires_after_minutes": 5,
+
+  "config": {
+    "BRANCH_BASE": "{value}",
+    "LINEAR_FILTER": { "team": "{value}", "label": "{value}", "status": ["{values}"] },
+    "PROJECT_STANDARDS": "{value}",
+    "BUILD_CMD": "{value}",
+    "LINT_CMD": "{value}",
+    "TEST_CMD": "{value}",
+    "TYPECHECK_CMD": "{value or null}",
+    "E2E_CMD": "{value or null}",
+    "COMMIT_PREFIX": "{value}",
+    "MAX_LOOP_ITERATIONS": "{value}",
+    "HUMAN_IN_LOOP": "{value}",
+    "PARTIAL_MERGE": "{value}",
+    "SPRINT_DASHBOARD": "{value}"
+  },
+
+  "sprint_hints": {
+    "loaded": true,
+    "plan_commit": "{SHA or null}",
+    "tickets": ["{ticket objects from sprint-hints.json}"],
+    "total_tickets": "{N}",
+    "coordination_mode_recommendation": "{Agent Teams or Subagents}",
+    "stale": false
+  },
+
+  "failure_patterns": {
+    "loaded": true,
+    "pattern_count": "{N}",
+    "high_frequency_patterns": ["{patterns with frequency ≥3}"]
+  },
+
+  "git_state": {
+    "branch_base": "{BRANCH_BASE}",
+    "safety_tag": "sprint-start-{timestamp}",
+    "head_sha": "{current HEAD SHA}"
+  },
+
+  "pre_flight_completed": {
+    "linear_connected": true,
+    "git_clean": true,
+    "baseline_build_passed": true,
+    "worktrees_verified": true,
+    "progress_txt_initialized": true
+  },
+
+  "user_choices": {
+    "coordination_mode": "{agent-teams or subagents — from Step 0G, or null if not yet chosen}",
+    "permission_mode": "{auto-approve or skip-all or manual or pre-configured — from Step 0J, or null if not yet chosen}"
+  },
+
+  "resume_instructions": "Load this file, skip Step 0A-0F.7. If user_choices.coordination_mode is set, also skip Step 0G. If user_choices.permission_mode is set, also skip Step 0J. Re-read orchestrate-parallel-sprint.md for behavioral rules, then proceed to the first unskipped step."
+}
+PREFLIGHTEOF
+
+# 3. Ensure sprint-preflight.json is gitignored
+git check-ignore -q .claude/sprint-preflight.json 2>/dev/null || echo ".claude/sprint-preflight.json" >> .gitignore
+
+# 4. Tell the user what's happening
+echo "✅ Sprint state saved to .claude/sprint-preflight.json"
+echo "   Compacting context now. Sprint will resume automatically after compaction."
+
+# 5. Trigger compaction (the orchestrator compacts itself)
+# After compaction, the orchestrator's FIRST actions are:
+#   a. Re-read orchestrate-parallel-sprint.md (reload behavioral rules)
+#   b. Check for .claude/sprint-preflight.json
+#   c. If found AND not stale (< 5 minutes old):
+#      - Load all state from the file
+#      - Skip Steps 0A through 0F.5 (already completed)
+#      - Delete the file (prevent stale reuse)
+#      - Proceed to coordination mode selection or Phase 1
+#   d. If stale or missing:
+#      - Run full Step 0 from scratch (safe fallback)
+```
+
+**If user chooses [2] — Proceed as-is:**
+```
+Log: "⚠️ User chose to proceed with ~{X}% context remaining. Sprint may degrade."
+Continue with Step 0A normally.
+The self-health monitoring at 70% (Rule 35) will still catch mid-sprint degradation.
+```
+
+**If user chooses [3] — Cancel:**
+```
+echo "Sprint cancelled. Start a fresh Claude Code session and re-invoke /sprint."
+STOP.
+```
+
+**If context is ≥60% remaining:** Skip this check entirely. Proceed silently to Step 0A.
+The user never sees this gate when context is healthy.
+
+### Step 0-Pre-Resume: Check for Sprint Pre-Flight Checkpoint
+
+**This runs immediately after any compaction.** If `sprint-preflight.json` exists, the
+orchestrator can skip re-parsing and jump ahead.
+
+```bash
+if [ -f .claude/sprint-preflight.json ]; then
+  # Validate freshness (must be < 5 minutes old)
+  created_at=$(jq -r '.created_at' .claude/sprint-preflight.json)
+  age_seconds=$(($(date +%s) - $(date -d "$created_at" +%s 2>/dev/null || echo 0)))
+
+  if [ "$age_seconds" -lt 300 ] && [ "$age_seconds" -gt 0 ]; then
+    echo "🔄 Found fresh sprint-preflight.json (${age_seconds}s old). Resuming sprint..."
+    echo "   Skipping Steps 0A-0F.5 (already completed before compaction)."
+
+    # Load all state from preflight file
+    CONFIG = read .claude/sprint-preflight.json → config
+    SPRINT_HINTS = read .claude/sprint-preflight.json → sprint_hints
+    FAILURE_PATTERNS = read .claude/failure-patterns.json  # re-read from disk (authoritative)
+    GIT_STATE = read .claude/sprint-preflight.json → git_state
+    PRE_FLIGHT = read .claude/sprint-preflight.json → pre_flight_completed
+    USER_CHOICES = read .claude/sprint-preflight.json → user_choices
+
+    # Restore user choices if they were already made before compaction
+    if USER_CHOICES.coordination_mode is not null:
+        COORDINATION_MODE = USER_CHOICES.coordination_mode
+        echo "   Coordination mode restored: ${COORDINATION_MODE}"
+    fi
+    if USER_CHOICES.permission_mode is not null:
+        PERMISSION_MODE = USER_CHOICES.permission_mode
+        echo "   Permission mode restored: ${PERMISSION_MODE}"
+    fi
+
+    # Verify git state hasn't changed during compaction
+    current_head=$(git rev-parse HEAD)
+    if [ "$current_head" != "{GIT_STATE.head_sha}" ]; then
+      echo "⚠️ HEAD moved during compaction. Running full pre-flight."
+      rm .claude/sprint-preflight.json
+      # Fall through to Step 0A
+    else
+      # Clean up — delete preflight file to prevent stale reuse
+      rm .claude/sprint-preflight.json
+
+      # Determine resume point based on what was already completed
+      if COORDINATION_MODE is set AND PERMISSION_MODE is set:
+          echo "✅ State restored. Skipping to Phase 1 (all pre-flight + user choices restored)."
+          # SKIP to Phase 1
+      elif COORDINATION_MODE is set:
+          echo "✅ State restored. Skipping to Step 0J (permission mode selection)."
+          # SKIP to Step 0J
+      else:
+          echo "✅ State restored. Skipping to Step 0G (coordination mode selection)."
+          # SKIP to Step 0G
+      fi
+    fi
+  else
+    echo "⚠️ sprint-preflight.json is stale (${age_seconds}s old). Ignoring."
+    rm .claude/sprint-preflight.json
+    # Fall through to Step 0A (full pre-flight)
+  fi
+fi
+```
+
+---
+
 ### Step 0A: Check Linear Connectivity
 ```
 Use Linear MCP tools to fetch one ticket from the configured team.
@@ -511,6 +757,8 @@ fi
 git check-ignore -q .claude/sprint-dashboard.md 2>/dev/null || echo ".claude/sprint-dashboard.md" >> .gitignore
 git check-ignore -q .claude/sprint-state.json 2>/dev/null || echo ".claude/sprint-state.json" >> .gitignore
 git check-ignore -q .claude/sprint-hints.json 2>/dev/null || echo ".claude/sprint-hints.json" >> .gitignore
+git check-ignore -q .claude/sprint-preflight.json 2>/dev/null || echo ".claude/sprint-preflight.json" >> .gitignore
+git check-ignore -q .claude/problem-statement.md 2>/dev/null || echo ".claude/problem-statement.md" >> .gitignore
 
 # 3. Commit gitignore changes if any
 if ! git diff --quiet .gitignore 2>/dev/null; then
@@ -543,6 +791,54 @@ if [ ! -f progress.txt ]; then
 EOF
   git add progress.txt
   git commit -m "chore: initialize sprint progress.txt"
+else
+  # progress.txt already exists — check if it needs pruning.
+  # After 20+ sprints, the "Completed Tickets" section can grow to thousands of lines.
+  # Workers read progress.txt FIRST, so bloat wastes their context window.
+  COMPLETED_LINES=$(sed -n '/^## Completed Tickets/,/^## /p' progress.txt | wc -l)
+  if [ "$COMPLETED_LINES" -gt 200 ]; then
+    LOG: "progress.txt Completed Tickets section has ${COMPLETED_LINES} lines — pruning."
+
+    # PRUNING STRATEGY:
+    # 1. Keep the "Codebase Patterns" section intact (this is the high-value knowledge)
+    # 2. Keep only the last 2 sprints' entries in "Completed Tickets"
+    # 3. Rotate older entries to .claude/sprint-history/progress-archive.md
+
+    # Extract the Codebase Patterns section (always preserved)
+    PATTERNS=$(sed -n '/^## Codebase Patterns/,/^## /p' progress.txt | head -n -1)
+
+    # Extract Completed Tickets section
+    COMPLETED=$(sed -n '/^## Completed Tickets/,$p' progress.txt)
+
+    # Find the last 2 sprint boundaries (sprint entries start with "### Sprint sprint-YYYYMMDD")
+    # Keep entries from the 2 most recent sprints
+    RECENT_SPRINTS=$(echo "$COMPLETED" | grep -n "^### Sprint" | tail -2 | head -1 | cut -d: -f1)
+    if [ -n "$RECENT_SPRINTS" ]; then
+      OLD_ENTRIES=$(echo "$COMPLETED" | head -n $((RECENT_SPRINTS - 1)) | tail -n +2)
+      RECENT_ENTRIES=$(echo "$COMPLETED" | tail -n +$RECENT_SPRINTS)
+
+      # Archive old entries
+      mkdir -p .claude/sprint-history
+      echo "# Progress Archive (rotated from progress.txt)" >> .claude/sprint-history/progress-archive.md
+      echo "# Archived at: $(date -u +%Y-%m-%dT%H:%M:%SZ)" >> .claude/sprint-history/progress-archive.md
+      echo "" >> .claude/sprint-history/progress-archive.md
+      echo "$OLD_ENTRIES" >> .claude/sprint-history/progress-archive.md
+
+      # Rebuild progress.txt with only recent entries
+      cat > progress.txt << PRUNEEOF
+# Sprint Progress
+
+${PATTERNS}
+
+## Completed Tickets
+${RECENT_ENTRIES}
+PRUNEEOF
+
+      git add progress.txt .claude/sprint-history/progress-archive.md
+      git commit -m "chore: prune progress.txt (rotated old entries to sprint-history)"
+      LOG: "Pruned ${COMPLETED_LINES} → $(wc -l < progress.txt) lines. Old entries archived."
+    fi
+  fi
 fi
 ```
 
@@ -600,6 +896,57 @@ The orchestrator injects `HIGH_FREQUENCY_PATTERNS` into Worker prompts as warnin
     Apply this preemptively to avoid a verification loop iteration.
 ```
 
+### Step 0F.7: Load Problem Statement (from /define)
+
+Check if `/define` was run before `/sprint`. Validate schema and check staleness
+(same pattern as /tickets Step 0-Pre).
+
+```bash
+if [ -f .claude/problem-statement.md ]; then
+  echo "📋 Found problem statement from /define. Loading..."
+  PROBLEM_STATEMENT = read .claude/problem-statement.md
+
+  # ─── SCHEMA VALIDATION (lightweight — sprint only needs key sections) ───
+  schema_version = extract "schema_version:" from header line
+  generated_commit = extract "generated_commit:" from header line
+
+  if schema_version is missing or < 2:
+      echo "⚠️  Problem statement has old schema (v${schema_version:-'none'}). Re-run /define recommended."
+  fi
+
+  # ─── STALENESS CHECK ───
+  if generated_commit is not empty:
+      current_head=$(git rev-parse HEAD)
+      if [ "$generated_commit" != "$current_head" ]; then
+          commits_apart=$(git rev-list --count ${generated_commit}..HEAD 2>/dev/null || echo "unknown")
+          echo "⚠️  Problem statement is ${commits_apart} commits behind HEAD."
+          echo "    User journey and codebase snapshot may be outdated."
+      fi
+  fi
+
+  # ─── EXTRACT KEY FIELDS ───
+  # Use heading-based extraction (same approach as /tickets Step 0-Pre Parsing Helper):
+  # Extract section by finding "## {heading}" and reading until next "## " heading.
+  # - USER_JOURNEY: E2E Test Agent (Phase 6) uses these as verification scenarios
+  # - SUCCESS_CRITERIA: Completion Agent (Layer 4) checks tickets against these
+  # - TESTING_STRATEGY: Configures how aggressive Phase 6 E2E testing should be
+  # - CONSTRAINTS: Passed to Worker Agents as context
+
+  user_journey_steps = extract "User Journey" section → count steps
+  success_criteria = extract "Success Criteria" section → count items
+  testing_level = extract "Testing Strategy > Level" field
+  echo "  User journey: ${user_journey_steps} steps"
+  echo "  Success criteria: ${success_criteria} items"
+  echo "  Testing level: ${testing_level}"
+  PROBLEM_STATEMENT_LOADED=true
+else
+  echo "ℹ️  No problem statement found (optional — /define was not run)."
+  PROBLEM_STATEMENT_LOADED=false
+fi
+```
+
+---
+
 ### Step 0G: Choose Coordination Mode
 
 Before deploying agents, ask the user which coordination mode to use:
@@ -654,9 +1001,44 @@ This affects how Phase 2 deploys its agents.
 
 If user selects Agent Teams, verify the experimental flag is set:
 ```bash
-# Check if agent teams are enabled
-grep -q "CLAUDE_CODE_EXPERIMENTAL_AGENT_TEAMS" .claude/settings.json 2>/dev/null
-# If not found → warn user and fall back to subagents
+# Check if agent teams are enabled — search multiple locations:
+AGENT_TEAMS_ENABLED=false
+
+# Location 1: Environment variable (most common)
+if [ -n "$CLAUDE_CODE_EXPERIMENTAL_AGENT_TEAMS" ]; then
+    AGENT_TEAMS_ENABLED=true
+fi
+
+# Location 2: Project settings (.claude/settings.json)
+if grep -q "CLAUDE_CODE_EXPERIMENTAL_AGENT_TEAMS" .claude/settings.json 2>/dev/null; then
+    AGENT_TEAMS_ENABLED=true
+fi
+
+# Location 3: Global settings (~/.claude/settings.json)
+if grep -q "CLAUDE_CODE_EXPERIMENTAL_AGENT_TEAMS" ~/.claude/settings.json 2>/dev/null; then
+    AGENT_TEAMS_ENABLED=true
+fi
+
+# Location 4: Local settings (.claude/settings.local.json)
+if grep -q "CLAUDE_CODE_EXPERIMENTAL_AGENT_TEAMS" .claude/settings.local.json 2>/dev/null; then
+    AGENT_TEAMS_ENABLED=true
+fi
+
+if [ "$AGENT_TEAMS_ENABLED" = "false" ]; then
+    echo "⚠️  Agent Teams flag not found. Checked: env var, .claude/settings.json,"
+    echo "    ~/.claude/settings.json, .claude/settings.local.json."
+    echo "    Falling back to subagents mode."
+    echo ""
+    echo "    To enable Agent Teams, set the environment variable:"
+    echo "      export CLAUDE_CODE_EXPERIMENTAL_AGENT_TEAMS=1"
+    echo "    Or add it to .claude/settings.json."
+    COORDINATION_MODE="subagents"
+fi
+
+# Even if the flag is found, Agent Teams may fail at runtime if the feature
+# isn't available in the user's Claude Code version. If Agent Team spawning
+# fails during Phase 2, the orchestrator falls back to subagent mode for
+# that ticket (see Agent Team Timeout / Deadlock Handling → case 4).
 ```
 
 ### Step 0G.5: Load Sprint Hints (from /tickets)
@@ -743,7 +1125,155 @@ STATEEOF
 **Update this file at EVERY phase transition and after every ticket state change.**
 If context is compacted, the orchestrator reads this file to recover state.
 
-### Step 0I: Log Pre-Flight Results
+**Valid phase values** (update `phase` and `dashboard.current_phase` together):
+```
+"0-preflight"       — Phase 0: Pre-flight checks and setup
+"1-context"         — Phase 1: Context Agents analyzing codebase
+"2-implementation"  — Phase 2: Worker Agents implementing tickets
+"2.5-simplifier"    — Phase 2.5: Code Simplifier Agent running (between ticket batches)
+"3-verification"    — Phase 3: Verification + Code Review loop (per-ticket)
+"4-merge"           — Phase 4: Merge Executor integrating branches
+"4.5-integration"   — Phase 4.5: Post-merge integration check (build + test on base)
+"5-evidence"        — Phase 5: Evidence assembly and Linear posting
+"6-e2e"             — Phase 6: E2E browser testing
+"7-remaining"       — Phase 7: Remaining ticket check (loop)
+"8-retrospective"   — Phase 8: Post-sprint learning loop
+"complete"          — Sprint finished
+"safety-stopped"    — Sprint halted by safety mechanism
+```
+
+### Step 0I: (Reserved — log moved to Step 0K after all user choices are made)
+
+### Step 0J: Permission Mode Selection
+
+Before spawning agents, ask the user how they want to handle permission prompts.
+A full sprint generates hundreds of tool calls (bash commands, file edits, git operations)
+across dozens of agents. Without pre-configuration, the user will face constant
+"Allow?" prompts that make the sprint impractical to run.
+
+**Present this prompt:**
+```
+═══════════════════════════════════════════════════════════════
+🔐 PERMISSION MODE
+═══════════════════════════════════════════════════════════════
+
+Your sprint is configured with these commands:
+  Build:     {BUILD_CMD}
+  Lint:      {LINT_CMD}
+  Test:      {TEST_CMD}
+  Typecheck: {TYPECHECK_CMD or "not configured"}
+  E2E:       {E2E_CMD or "not configured"}
+
+A {N}-ticket sprint will spawn ~{N*8} agent context windows,
+each running multiple bash commands. Without permission config,
+you'll face hundreds of "Allow?" prompts.
+
+Options:
+  [1] Auto-approve sprint commands (Recommended)
+      Adds your sprint commands to allowedTools. You'll only be
+      prompted for unexpected commands. Safe and practical.
+
+  [2] Skip all permissions (--dangerously-skip-permissions)
+      Full autonomous mode. No prompts at all. Fastest, but
+      agents can run ANY command without approval.
+      Only recommended in isolated environments (Docker/VM).
+
+  [3] Manual approval
+      Default permission behavior. You approve every command.
+      Only practical for very small sprints (1-2 tickets).
+
+  [4] I've already configured permissions — skip this step
+
+Choose [1/2/3/4]:
+═══════════════════════════════════════════════════════════════
+```
+
+**If user chooses [1] — Auto-approve sprint commands:**
+
+Display the exact `allowedTools` configuration for their `.claude/settings.json`:
+
+```
+To auto-approve sprint commands, add these to your
+.claude/settings.json under "allow":
+
+{
+  "permissions": {
+    "allow": [
+      "Edit",
+      "MultiEdit",
+      "Write",
+      "Bash(npm run build)",
+      "Bash(npm run lint)",
+      "Bash(npm run test:run)",
+      "Bash(npx tsc --noEmit)",
+      "Bash(git *)",
+      "Bash(mkdir *)",
+      "Bash(cp *)",
+      "Bash(agent-browser *)",
+      "Bash(curl -sf http://localhost*)"
+    ]
+  }
+}
+
+NOTE: These patterns are derived from YOUR sprint config.
+Only the commands you configured above will be auto-approved.
+```
+
+Then ask: "Have you added these to your settings? [yes/skip]"
+
+If "yes" → proceed to Phase 1.
+If "skip" → proceed with manual permissions (user's choice).
+
+**Important:** The orchestrator does NOT modify `.claude/settings.json` itself.
+Modifying security settings programmatically is a boundary the orchestrator must not cross.
+The user copies the config manually so they own the decision.
+
+**If user chooses [2] — Skip all permissions:**
+
+```
+⚠️  You've chosen to skip all permissions. This means agents can run
+ANY command without approval, including potentially destructive operations.
+
+To enable this, start Claude Code with:
+  claude --dangerously-skip-permissions
+
+If you're already in a session, you'll need to restart with this flag.
+Are you running with --dangerously-skip-permissions? [yes/no]
+```
+
+If "yes" → proceed to Phase 1.
+If "no" → tell user to restart with the flag, then re-run `/sprint`.
+
+**Safety net for option 2:** Even with permissions skipped, the orchestrator's
+own rules still prevent destructive actions (Rule 10: no force pushes,
+Rule 18: no git reset --hard on main). These are prompt-level guardrails
+that don't depend on the permission system.
+
+**If user chooses [3] — Manual approval:**
+
+```
+ℹ️  Manual approval mode. You'll be prompted for each command.
+    Tip: Press Shift+Tab during the sprint to toggle auto-accept edits on/off.
+    This at least eliminates file edit prompts while keeping bash prompts.
+
+Proceeding to Phase 1...
+```
+
+**If user chooses [4] — Already configured:**
+
+```
+✅ Skipping permission setup. Proceeding to Phase 1...
+```
+
+Store the choice in sprint-state.json:
+```json
+"permission_mode": "{auto-approve|skip-all|manual|pre-configured}"
+```
+
+### Step 0K: Log Pre-Flight Results
+
+**This runs AFTER all user choices (coordination mode + permission mode) are made.**
+
 ```
 PRE-FLIGHT COMPLETE
 ├── Linear: Connected ✓
@@ -752,12 +1282,15 @@ PRE-FLIGHT COMPLETE
 ├── Snapshot: sprint-start-YYYYMMDD-HHMMSS ✓
 ├── Worktrees: .gitignore verified, stale cleaned ✓
 ├── progress.txt: Initialized ✓
+├── Failure patterns: {N} loaded ({M} high-frequency) ✓
+├── Problem statement: {loaded | not found} ✓
 ├── Coordination: {COORDINATION_MODE} ✓
 ├── sprint-state.json: Initialized ✓
+├── Permission mode: {PERMISSION_MODE} ✓
 └── Ready for Phase 1
 ```
 
-**If ANY step fails → STOP and fix before proceeding.**
+**If ANY step above failed → STOP and fix before proceeding.**
 
 ---
 
@@ -1216,6 +1749,34 @@ should match the pattern for "Edge Cases". Never require exact string equality.
 }
 {IF no matching patterns: omit this section entirely}
 
+## Testing Level Constraint (from /define problem statement)
+{IF PROBLEM_STATEMENT exists AND extract_section("Testing Strategy") is not empty:
+  TESTING_LEVEL = extract "Level:" value from Testing Strategy section
+  # Inject the appropriate constraint based on the testing level:
+  IF TESTING_LEVEL == "Full":
+    "Testing level: FULL. You MUST write:
+     - Unit tests for every new function (3+ cases: happy path, error, edge case)
+     - Integration tests for any API/service interactions
+     - Edge case tests for ALL edge cases listed in the ticket
+     E2E tests are handled separately in Phase 6 — do NOT write them here."
+  ELIF TESTING_LEVEL == "Standard":
+    "Testing level: STANDARD. You MUST write:
+     - Unit tests for every new function (3+ cases)
+     - Integration tests for API/service interactions where applicable
+     - Edge case tests for edge cases listed in the ticket"
+  ELIF TESTING_LEVEL == "Minimal":
+    "Testing level: MINIMAL. You MUST write:
+     - Unit tests for core logic functions only (happy path + 1 error case)
+     - Edge case tests ONLY for edge cases explicitly listed in the ticket
+     Skip integration tests unless the ticket specifically requires them."
+  ELIF TESTING_LEVEL == "Custom":
+    "Testing level: CUSTOM. Follow these specific test requirements:
+     {extract testing details from Testing Strategy section}"
+}
+{IF PROBLEM_STATEMENT is null or Testing Strategy section is empty:
+  omit this section — default Worker workflow already requires tests
+}
+
 ## Project Standards
 Read {PROJECT_STANDARDS} at the repo root FIRST. Follow it exactly.
 
@@ -1476,6 +2037,12 @@ IF YOU ARE THE ORCHESTRATOR AND YOU ARE READING THIS AFTER AN AGENT TEAM COMPLET
 ---
 
 ## PHASE 2.5: CODE SIMPLIFIER (PER TICKET — BEFORE VERIFICATION)
+
+**NOTE ON PLACEMENT:** This section DEFINES the simplifier agent and its skip/run rules.
+The actual EXECUTION happens inside the Phase 3 verification loop as **Layer 1.5** (see Loop
+Logic). The simplifier runs exactly ONCE per ticket, on the first pass that clears Layer 1
+(evidence check), so that the simplified code gets verified in a single pass. Step 2C below
+contains the agent prompt. If you're looking for when it runs, see the loop logic at Layer 1.5.
 
 After each worker agent completes but BEFORE verification, optionally run the code-simplifier
 to clean up the worker's code. This uses the `code-simplifier` plugin agent (Opus)
@@ -1918,6 +2485,15 @@ You may NOT claim this ticket is complete unless you have:
 ## Original Ticket Description
 {TICKET_DESCRIPTION}
 
+## Problem Statement Success Criteria (from /define)
+{IF PROBLEM_STATEMENT_LOADED:
+  These are the overall success criteria the user defined for the feature.
+  Check which criteria THIS ticket is responsible for and verify them:
+  {PASTE relevant success criteria from .claude/problem-statement.md}
+  If this ticket doesn't cover any success criteria, note "N/A — this ticket
+  is infrastructure/internal" and continue with ticket-level requirements only.
+}
+
 ## Your Task — Line-by-Line Requirement Matching
 For EACH requirement/acceptance criterion in the ticket:
 
@@ -2057,6 +2633,13 @@ while loop_count < MAX_LOOPS:
     # Verification Agent (mechanical) and Code Review Agent (quality) are INDEPENDENT.
     # Running them in parallel cuts verification time nearly in half for passing tickets.
     # Both are spawned simultaneously; we gate on "both pass" before Layer 4.
+    #
+    # PROCESSING ORDER (after both complete):
+    #   1. Check verification first (hard mechanical failures)
+    #   2. If verification fails → combine with any review issues → single Worker resume
+    #   3. If verification passes → check review (quality issues)
+    #   4. If both pass → proceed to Layer 2.5 (edge cases)
+    # This ensures we never send the Worker back twice for issues caught in parallel.
 
     verification, review = run IN PARALLEL:
         verification = run Verification Agent   # Layer 2: exit codes, test counts, config
@@ -2066,7 +2649,7 @@ while loop_count < MAX_LOOPS:
     VERIFICATION_RAW_OUTPUT = verification.RAW_TERMINAL_OUTPUT
     CODE_REVIEW_RAW_OUTPUT = review.RAW_OUTPUT
 
-    # ─── Process Layer 2 result (Verification) ───
+    # ─── Process Layer 2 result (Verification) — checked FIRST ───
     if verification.VERIFIED == false:
         current_error = classify_error(verification.failures)
         if current_error.type == last_error?.type:
@@ -2074,7 +2657,8 @@ while loop_count < MAX_LOOPS:
         else:
             consecutive_same_error = 1
         last_error = current_error
-        # Include code review issues too (if any) to avoid another round trip
+        # COMBINE: If review also found issues, bundle them into one feedback message.
+        # This avoids a second round trip if the Worker fixes verification but not review.
         combined_feedback = verification.failures
         if review.PASS == false:
             combined_feedback += "\n\nAlso, code review found: " + review.issues_summary
@@ -2122,9 +2706,18 @@ while loop_count < MAX_LOOPS:
             match = grep -l "{function_name}" test_files | xargs grep -l "{condition_keyword}"
 
             if no match found:
-                # Fallback: check if test description mentions the edge case
+                # Fallback 1: check if test description mentions the edge case
                 match = grep -rl "it\(.*{condition_keyword}" test_files
             if still no match:
+                # Fallback 2: Semantic search — the grep may miss synonyms or rephrased conditions.
+                # Search test files for the function name alone, then check surrounding context
+                # (±10 lines) for ANY of these semantic indicators:
+                #   - The condition_keyword itself
+                #   - Common synonyms: "empty" ↔ "blank" ↔ "missing", "null" ↔ "undefined" ↔ "nil"
+                #   - The expected behavior from the edge case description
+                # This catches cases like: edge case says "empty string" but test says "blank input"
+                semantic_matches = grep -l "{function_name}" test_files | xargs grep -B10 -A10 "{function_name}" | grep -iE "{condition_keyword}|{synonyms}|{expected_behavior_keyword}"
+            if still no match after all fallbacks:
                 missing_edge_cases.append(edge_case)
 
         if missing_edge_cases is not empty:
@@ -2677,14 +3270,42 @@ produced conflicts in these files:
 RESOLUTION_REPORT:
   files_resolved: [{file, strategy_used}]
   acceptance_preserved:
-    ticket_a: {all criteria still met? YES/NO}
-    ticket_b: {all criteria still met? YES/NO}
-  tests_after_resolution:
-    COMMAND: {TEST_CMD}
-    EXIT_CODE: {0 or non-zero}
-    OUTPUT: |
-      {actual output}
-    VERDICT: PASS or FAIL
+    ticket_a: {all criteria still met? YES/NO — explain which criteria and how verified}
+    ticket_b: {all criteria still met? YES/NO — explain which criteria and how verified}
+  evidence:
+    # FULL quality gate evidence for BOTH tickets (not just tests)
+    build:
+      COMMAND: {BUILD_CMD}
+      EXIT_CODE: {0 or non-zero}
+      OUTPUT: |
+        {actual output — paste raw terminal output}
+    lint:
+      COMMAND: {LINT_CMD}
+      EXIT_CODE: {0 or non-zero}
+      OUTPUT: |
+        {actual output}
+    typecheck:
+      COMMAND: {TYPECHECK_CMD}
+      EXIT_CODE: {0 or non-zero}
+      OUTPUT: |
+        {actual output}
+    tests_ticket_a:
+      COMMAND: {TEST_CMD} --grep "{TICKET_A_PATTERN}"
+      EXIT_CODE: {0 or non-zero}
+      OUTPUT: |
+        {actual output}
+    tests_ticket_b:
+      COMMAND: {TEST_CMD} --grep "{TICKET_B_PATTERN}"
+      EXIT_CODE: {0 or non-zero}
+      OUTPUT: |
+        {actual output}
+    full_suite:
+      COMMAND: {TEST_CMD}
+      EXIT_CODE: {0 or non-zero}
+      OUTPUT: |
+        {actual output}
+  VERDICT: ALL_PASS or PARTIAL_FAIL or FULL_FAIL
+  # ALL evidence must be raw terminal output. Claims without output are RULE 4 violations.
 
 Commit resolution: "merge: resolve conflicts for {TICKET_ID}"
 ```
@@ -2798,6 +3419,31 @@ Spawn one E2E testing agent **per ticket**, all in parallel.
 These agents perform **behavioral verification** — they don't just run tests,
 they verify the feature actually works by interacting with the running application.
 
+**Uses `agent-browser` (Vercel) instead of Playwright for E2E browser interactions.**
+Agent-browser uses 82-93% less context than Playwright MCP (snapshot refs vs full DOM trees),
+leaving agents more room for actual verification logic. Each agent gets its own isolated
+session via `--session`, preventing the port collision issues of parallel Playwright instances.
+
+### Pre-Phase 6: Orchestrator starts ONE dev server
+
+```bash
+# The ORCHESTRATOR starts a single dev server BEFORE spawning E2E agents.
+# This prevents N parallel agents from each trying to start their own server
+# (which causes EADDRINUSE port collisions).
+npm run dev &
+DEV_PID=$!
+
+# Wait for the server to be ready
+for i in $(seq 1 30); do
+  curl -s http://localhost:3000/api/health >/dev/null 2>&1 && break
+  sleep 1
+done
+
+# DEV_PID is passed to all E2E agents. Only the orchestrator kills it at the end.
+```
+
+### E2E Agent Setup
+
 ```yaml
 subagent_type: "general-purpose"
 model: "sonnet"
@@ -2815,39 +3461,126 @@ You must verify the feature BEHAVES correctly in a running application.
 ## Ticket Description
 {TICKET_DESCRIPTION}
 
-## Step 1: Start the Application
-Start the dev server (if not already running):
-  npm run dev &
-  DEV_PID=$!
-Wait for it to be ready (poll the health endpoint or check stderr for "ready").
+## Tool: agent-browser (Vercel)
+You use `agent-browser` CLI for all browser interactions. It uses 82-93% less context
+than Playwright MCP by returning lightweight @ref snapshots instead of full DOM trees.
+
+### Core Workflow: Navigate → Snapshot → Interact → Re-snapshot
+```bash
+# Always chain commands with && when intermediate output isn't needed
+agent-browser open http://localhost:3000/{path} && agent-browser snapshot -i
+# snapshot -i returns interactive elements as @e1, @e2, etc.
+# Use these refs for ALL subsequent interactions:
+agent-browser click @e3 && agent-browser snapshot -i
+agent-browser fill @e5 "test input" && agent-browser snapshot -i
+```
+
+### Key Commands
+- `open <url>` — Navigate to page
+- `snapshot -i` — Get interactive elements with @refs (ALWAYS re-snapshot after actions)
+- `click @ref` — Click an element
+- `fill @ref "text"` — Clear and fill input
+- `type @ref "text"` — Append text to input
+- `get text @ref` — Extract element text
+- `get url` — Get current URL
+- `wait @ref` — Wait for element to appear
+- `screenshot [path]` — Capture viewport for visual evidence
+- `eval "javascript"` — Execute JS in page context
+
+### Session Isolation (CRITICAL for parallel execution)
+Use `--session {TICKET_ID}` on EVERY command to prevent interference with other
+E2E agents running in parallel:
+```bash
+agent-browser --session {TICKET_ID} open http://localhost:3000/{path}
+agent-browser --session {TICKET_ID} snapshot -i
+agent-browser --session {TICKET_ID} click @e3
+```
+
+### Ref Lifecycle Warning
+Refs (@e1, @e2, etc.) INVALIDATE after any page change (navigation, form submit,
+dynamic content update). Always re-snapshot after actions that change the page.
+
+## Step 1: Application is Already Running
+The orchestrator has started the dev server at http://localhost:3000.
+Do NOT start your own dev server. Just verify it's responsive:
+```bash
+curl -sf http://localhost:3000/api/health || echo "DEV SERVER NOT READY"
+```
 
 ## Step 2: Run Existing E2E Tests
-{E2E_CMD} --grep "{relevant test pattern}"
+If Playwright/Vitest E2E tests exist for this feature, run them:
+```bash
+{E2E_CMD} --grep "{relevant test pattern}" 2>&1 || true
+```
 Capture: test output, pass/fail counts, any error messages.
+If no E2E test runner is configured, skip to Step 3.
 
-## Step 3: Write Missing E2E Tests
-If no E2E tests exist for this feature, write one that:
-  - Tests the happy path end-to-end
-  - Tests at least one error/edge case
-  - Verifies the user-facing behavior, not just internal state
-Run the new test and capture output.
+## Step 3: Browser-Based Behavioral Verification (agent-browser)
+This is the PRIMARY verification method. Use agent-browser to interact with
+the running application and verify the feature works end-to-end.
 
-## Step 4: Behavioral Verification
-Go beyond tests — verify the feature actually works:
-  a. HIT ENDPOINTS: If this is an API feature, curl the endpoints:
+{IF PROBLEM_STATEMENT_LOADED:
+  ## User Journey Scenarios (from /define)
+  The user defined these as their expected experience when the feature is complete.
+  Test EACH step as a browser interaction:
+  {PASTE user journey steps from .claude/problem-statement.md}
+  Each step = one agent-browser interaction sequence with evidence capture.
+}
+
+  a. NAVIGATE to the feature:
+     ```bash
+     agent-browser --session {TICKET_ID} open http://localhost:3000/{feature-path}
+     agent-browser --session {TICKET_ID} snapshot -i
+     ```
+
+  b. INTERACT with the feature (happy path):
+     - Fill forms, click buttons, navigate flows
+     - Capture snapshots at each step as evidence
+     - Verify page content changes as expected:
+       ```bash
+       agent-browser --session {TICKET_ID} get text @e7  # Check result text
+       agent-browser --session {TICKET_ID} get url        # Verify redirect
+       agent-browser --session {TICKET_ID} screenshot evidence-{TICKET_ID}-happy.png
+       ```
+
+  c. TEST ERROR CASES via browser:
+     - Submit empty forms, invalid data
+     - Verify error messages appear:
+       ```bash
+       agent-browser --session {TICKET_ID} fill @e3 ""
+       agent-browser --session {TICKET_ID} click @e5  # Submit
+       agent-browser --session {TICKET_ID} snapshot -i  # Check for error message
+       ```
+
+  d. HIT API ENDPOINTS directly (if this is an API feature):
+     ```bash
      curl -s http://localhost:3000/api/{relevant-path} | jq .
-     Verify the response shape, status codes, and data.
-  b. CHECK DATABASE STATE: If this creates/modifies data, query the DB
+     ```
+     Verify response shape, status codes, and data.
+
+  e. CHECK DATABASE STATE: If this creates/modifies data, query the DB
      to verify the data is actually persisted correctly.
-  c. CHECK INTEGRATION POINTS:
+
+  f. CHECK INTEGRATION POINTS:
      - Does this feature's code connect properly to the rest of the app?
      - Are imports resolving? Are types matching across boundaries?
      - Do cross-ticket integrations work?
-  d. CHECK LOGS: Verify no unexpected errors or warnings in server logs.
 
-## Step 5: Collect Evidence
+  g. CHECK LOGS: Verify no unexpected errors or warnings in server logs:
+     ```bash
+     agent-browser --session {TICKET_ID} eval "window.__SERVER_ERRORS || []"
+     ```
+
+## Step 4: Collect Evidence
 Output E2E_RESULT with:
-  - test_output: {full test command output}
+  - browser_verification: [
+      { step: "{description}", snapshot_before: "{@refs}", action: "{command}",
+        snapshot_after: "{@refs}", result: "PASS/FAIL", evidence: "{text/screenshot}" }
+    ]
+  - api_checks: [
+      { endpoint: "{path}", status: {code}, response_valid: true/false }
+    ]
+  - test_output: {E2E test command output, if ran}
   - tests_passed: {N}
   - tests_failed: {N}
   - behavioral_checks: [
@@ -2864,11 +3597,11 @@ Output E2E_RESULT with:
 If ANY test fails OR behavioral check fails:
 1. DO NOT create Linear tickets yourself. Return failures in E2E_RESULT.
 2. Include in your failure report:
-   - What failed (exact error message or curl output)
+   - What failed (exact error message, snapshot, or curl output)
    - Expected behavior
-   - Actual behavior (with evidence)
+   - Actual behavior (with evidence — screenshots, @ref text, curl responses)
    - File paths involved
-   - Steps to reproduce
+   - Steps to reproduce (agent-browser commands that trigger the failure)
    - Suggested fix approach
 3. Add a learning to progress.txt:
    "E2E: {what broke and why}"
@@ -2884,7 +3617,18 @@ The ORCHESTRATOR will create Linear tickets for each E2E failure using:
 Output: E2E_PASS for ticket {TICKET_ID} — with evidence summary.
 
 ## Cleanup
-kill $DEV_PID 2>/dev/null  # Stop the dev server when done
+```bash
+agent-browser --session {TICKET_ID} close  # Release browser session
+# Do NOT kill the dev server — the orchestrator handles that after ALL E2E agents complete.
+```
+```
+
+### Post-Phase 6: Orchestrator cleans up
+
+```bash
+# After ALL E2E agents complete, the orchestrator kills the shared dev server
+kill $DEV_PID 2>/dev/null
+echo "Dev server stopped. E2E verification complete."
 ```
 
 ---
@@ -2897,13 +3641,18 @@ After E2E testing completes:
 iteration_count += 1
 
 # Query Linear for remaining tickets
-# NOTE: Use status ["Todo", "In Progress"] here regardless of the original LINEAR_FILTER.status.
+# NOTE: Combine the ORIGINAL LINEAR_FILTER.status values with "Todo" (always included).
 # E2E failures (Phase 6) create NEW tickets with status "Todo". If the original filter was
 # narrow (e.g., only "In Progress" for a resumed sprint), those new tickets would be missed.
+# We also preserve the original filter's statuses so that tickets in custom workflow states
+# (e.g., "Backlog", "Ready for Dev") aren't dropped.
+PHASE7_STATUSES = deduplicate(LINEAR_FILTER.status + ["Todo"])
+# Example: original filter ["In Progress"] → PHASE7_STATUSES = ["In Progress", "Todo"]
+# Example: original filter ["Todo", "In Progress"] → PHASE7_STATUSES = ["Todo", "In Progress"]
 remaining = fetch tickets from Linear where:
   team = {LINEAR_FILTER.team}
   label = {LINEAR_FILTER.label}
-  status IN ["Todo", "In Progress"]  # Always include "Todo" to catch E2E-created tickets
+  status IN {PHASE7_STATUSES}
 
 if remaining.length == 0:
     → SPRINT COMPLETE. Log summary and exit.
@@ -2914,6 +3663,77 @@ if iteration_count >= MAX_LOOP_ITERATIONS:
 
 # New tickets exist (created by E2E failures or remaining from original batch)
 → Go to PHASE 2 with remaining tickets
+```
+
+---
+
+## PHASE 7.5: CROSS-TICKET FEATURE COMPLETENESS CHECK
+
+After all tickets are processed (remaining.length == 0) but BEFORE Phase 8,
+verify that the combined work actually delivers the feature described in `/define`.
+Individual tickets may all pass their own tests but still miss a cross-cutting concern.
+
+```
+# Only run if a problem statement exists
+if [ -f .claude/problem-statement.md ]; then
+
+    success_criteria = extract_section("Success Criteria") from .claude/problem-statement.md
+    implied_features = extract_section("Implied Features") from .claude/problem-statement.md
+    user_journey = extract_section("User Journey") from .claude/problem-statement.md
+
+    # For each success criterion, verify it was addressed by at least one completed ticket
+    UNMET_CRITERIA = []
+    for criterion in success_criteria:
+        # Extract 2-3 keywords from the criterion
+        keywords = extract_keywords(criterion)  # same algorithm as /tickets Approval Gate
+        # Search across ALL completed ticket branches (now merged into base)
+        matches = git log --all --oneline --grep="{keyword}" {BRANCH_BASE}..HEAD
+        # Also search the actual code changes
+        code_matches = git diff {SAFETY_TAG}..HEAD | grep -i "{keywords}"
+        if no matches found:
+            UNMET_CRITERIA.append(criterion)
+
+    # For each implied feature, verify it exists in the codebase
+    MISSING_FEATURES = []
+    for feature in implied_features:
+        keywords = extract_keywords(feature)
+        code_exists = grep -r "{keywords}" src/ app/ lib/ --include="*.ts" --include="*.tsx" --include="*.js" --include="*.jsx" 2>/dev/null
+        if no code_exists:
+            MISSING_FEATURES.append(feature)
+
+    if UNMET_CRITERIA is not empty OR MISSING_FEATURES is not empty:
+        LOG WARNING: "FEATURE COMPLETENESS GAP DETECTED"
+        LOG: "  Unmet success criteria: {UNMET_CRITERIA}"
+        LOG: "  Missing implied features: {MISSING_FEATURES}"
+
+        # Present to user for decision
+        Present:
+          "## Feature Completeness Check"
+          "The sprint completed all tickets, but these items from the problem statement"
+          "may not be fully addressed:"
+          ""
+          "### Unmet Success Criteria:"
+          {list UNMET_CRITERIA or "None — all criteria appear covered"}
+          ""
+          "### Missing Implied Features:"
+          {list MISSING_FEATURES or "None — all implied features appear present"}
+          ""
+          "Options:"
+          "  [1] Create follow-up tickets — generate new tickets for gaps"
+          "  [2] Ignore — these are false positives or out of scope"
+          "  [3] Manual review — I'll check these myself"
+
+        if user selects [1]:
+            # Create new tickets in Linear for each gap
+            for gap in (UNMET_CRITERIA + MISSING_FEATURES):
+                create_ticket(title="Complete: {gap}", description="...", priority=3)
+            → Go to PHASE 2 with new tickets
+
+    else:
+        LOG: "Feature completeness check PASSED — all success criteria and implied features covered."
+
+fi
+# If no problem statement, skip this phase silently
 ```
 
 ---
@@ -2994,8 +3814,41 @@ Analyze what happened and extract learnings for future sprints.
 {READ .claude/sprint-state.json}
 {READ .claude/sprint-dashboard.md}
 {READ progress.txt}
+{IF exists .claude/problem-statement.md: READ .claude/problem-statement.md}
 
 ## Analysis Required
+
+### 0. Problem Statement Comparison (if available)
+{IF .claude/problem-statement.md was loaded:
+  Compare the sprint's final state against the original problem statement:
+
+  a. USER JOURNEY COVERAGE: For each step in the "User Journey" section,
+     determine if the sprint produced code that implements that step.
+     Check git diff {SAFETY_TAG}..HEAD for evidence of each journey step.
+     Rate: FULLY_COVERED | PARTIALLY_COVERED | NOT_COVERED
+
+  b. SUCCESS CRITERIA SATISFACTION: For each criterion in "Success Criteria",
+     check if at least one completed ticket addressed it. Cross-reference
+     sprint-state.json ticket descriptions with criteria keywords.
+     Rate: MET | PARTIALLY_MET | NOT_MET
+
+  c. IMPLIED FEATURES DELIVERY: For each item in "Implied Features",
+     verify the feature exists in the codebase.
+     Rate: DELIVERED | MISSING
+
+  d. OVERALL VERDICT: Did we solve the original problem?
+     - GREEN: All user journey steps covered, all success criteria met
+     - YELLOW: Some gaps but core problem is solved
+     - RED: Original problem not fully addressed
+
+  Include this in the RETROSPECTIVE_REPORT as a new section:
+  ### Problem Statement Alignment:
+    user_journey_coverage: {list of steps with ratings}
+    success_criteria_satisfaction: {list of criteria with ratings}
+    implied_features_delivery: {list of features with ratings}
+    overall_verdict: {GREEN/YELLOW/RED}
+    gaps_identified: {list of any NOT_COVERED/NOT_MET/MISSING items}
+}
 
 ### 1. Ticket Analysis
 For each ticket:
@@ -3169,7 +4022,7 @@ The orchestrator itself follows these principles:
 | Scheduler Agent | Sonnet | None | `subagent_type: "general-purpose"` | 1 (global) | Conflict prediction + merge ordering |
 | Conflict Agent | Opus | None — operates on main repo | `subagent_type: "general-purpose"` | 0-N (on conflict) | Resolve merges with intent context |
 | Build Gate Agent | Opus | None — operates on main repo | `subagent_type: "general-purpose"` | 0-N (on failure) | Fix build failures (after bisection) |
-| E2E Test Agent | Sonnet | None — tests merged code | `subagent_type: "general-purpose"` | 1 per ticket | Behavioral verification |
+| E2E Test Agent | Sonnet | None — tests merged code | `subagent_type: "general-purpose"` | 1 per ticket | Behavioral verification via agent-browser CLI (`--session {TICKET_ID}` isolation) |
 | Retrospective Agent | Sonnet | None | `subagent_type: "general-purpose"` | 1 (global) | Post-sprint analysis + learning extraction |
 
 **All agents receive ANTI-HALLUCINATION RULES in their prompt. No exceptions.**
@@ -3230,7 +4083,21 @@ git branch --list "worktree-*" | while read branch; do
   fi
 done
 
-# 4. Archive sprint-state.json alongside the retrospective
+# 4. Kill any lingering dev server from Phase 6
+# The orchestrator starts a dev server in Pre-Phase 6 and should kill it in Post-Phase 6,
+# but if the sprint safety-stopped during E2E testing, DEV_PID may still be alive.
+if [ -n "$DEV_PID" ]; then
+  kill $DEV_PID 2>/dev/null && echo "Killed lingering dev server (PID: $DEV_PID)"
+fi
+# Also kill any orphaned dev servers on the standard ports
+for port in 3000 3001 5173 8080; do
+  pid=$(lsof -ti :$port 2>/dev/null)
+  if [ -n "$pid" ]; then
+    kill $pid 2>/dev/null && echo "Killed orphaned process on port $port (PID: $pid)"
+  fi
+done
+
+# 5. Archive sprint-state.json alongside the retrospective
 if [ -f .claude/sprint-state.json ]; then
   sprint_id=$(jq -r '.sprint_id // "unknown"' .claude/sprint-state.json 2>/dev/null)
   mkdir -p .claude/sprint-history
@@ -3239,7 +4106,7 @@ if [ -f .claude/sprint-state.json ]; then
   rm .claude/sprint-state.json
 fi
 
-# 5. Final status
+# 6. Final status
 git worktree list
 echo "Cleanup complete."
 ```
@@ -3249,6 +4116,12 @@ echo "Cleanup complete."
 ## EXECUTION CHECKLIST
 
 ```
+[ ] Step 0-Pre: Context Pre-Flight Check
+    [ ] Context window estimated (≥60% remaining?)
+    [ ] If <60%: user prompted with [Compact+Continue / Proceed / Cancel]
+    [ ] If Compact: Steps 0A-0F.5 run, sprint-preflight.json written, compaction triggered
+    [ ] If Resume: sprint-preflight.json loaded, freshness validated, state restored
+
 [ ] Phase 0: Pre-flight
     [ ] Linear MCP connected and authenticated
     [ ] Base branch clean and up-to-date
@@ -3256,15 +4129,24 @@ echo "Cleanup complete."
     [ ] Safety snapshot tagged
     [ ] .claude/worktrees/ in .gitignore
     [ ] Stale worktrees cleaned
-    [ ] progress.txt initialized
+    [ ] progress.txt initialized (or pruned if Completed Tickets > 200 lines)
     [ ] Failure pattern database loaded (.claude/failure-patterns.json)
     [ ] High-frequency patterns logged (if any ≥3 occurrences)
+    [ ] Problem statement loaded (if .claude/problem-statement.md exists from /define)
+    [ ] Problem statement schema validated (schema_version ≥ 2)
+    [ ] Problem statement staleness checked (generated_commit vs HEAD)
+    [ ] User journey steps extracted for Phase 6 E2E scenarios
+    [ ] Success criteria extracted for Layer 4 Completion Agent
     [ ] Coordination mode chosen (Subagents or Agent Teams)
     [ ] Agent Teams env flag verified (if Agent Teams mode)
     [ ] sprint-state.json initialized with all ticket entries
     [ ] INTRA_SPRINT_LEARNINGS buffer initialized (empty)
     [ ] Sprint dashboard created (.claude/sprint-dashboard.md)
     [ ] Pre-flight log includes coordination mode + sprint-state status
+    [ ] Permission mode selected (auto-approve / skip-all / manual / pre-configured)
+    [ ] If auto-approve: allowedTools config displayed, user confirmed
+    [ ] If skip-all: --dangerously-skip-permissions flag verified
+    [ ] Permission mode stored in sprint-state.json
 
 [ ] Phase 1: Tickets fetched
     [ ] {N} tickets loaded from Linear
@@ -3347,19 +4229,30 @@ echo "Cleanup complete."
     [ ] If PARTIAL_MERGE: failing ticket reverted, remaining tickets intact
     [ ] Sprint dashboard updated ({M}/{N} tickets merged status)
 
-[ ] Phase 6: E2E Behavioral Verification
-    [ ] Dev server started and endpoints hit
-    [ ] All E2E tests pass
-    [ ] Behavioral checks pass (endpoints, DB state, logs)
+[ ] Phase 6: E2E Behavioral Verification (agent-browser)
+    [ ] Pre-Phase 6: Orchestrator started shared dev server (one for all E2E agents)
+    [ ] Each E2E agent uses --session {TICKET_ID} for browser isolation
+    [ ] Step 1: Dev server responsive (curl health check)
+    [ ] Step 2: Existing E2E tests pass (E2E_CMD, if configured)
+    [ ] Step 3: agent-browser snapshot → interact → verify behaviors
+    [ ] Step 4: Evidence collected (screenshots, assertion results, snapshot refs)
+    [ ] Post-Phase 6: Orchestrator killed shared dev server
     [ ] Failure tickets created on Linear with evidence (if any)
 
 [ ] Phase 7: Remaining ticket check
     [ ] No tickets remain (or safety cap reached)
     [ ] Fix-up loop iterations: {N}/{MAX_LOOP_ITERATIONS}
 
+[ ] Phase 7.5: Cross-ticket feature completeness check
+    [ ] Problem statement success criteria compared against completed work
+    [ ] Implied features verified in codebase
+    [ ] Gaps presented to user (if any) with follow-up options
+    [ ] (Skipped if no problem statement exists)
+
 [ ] Phase 8: Post-Sprint Learning Loop
-    [ ] Retrospective Agent analyzed sprint-state.json + dashboard + progress.txt
-    [ ] RETROSPECTIVE_REPORT generated (what worked, what failed, patterns)
+    [ ] Retrospective Agent analyzed sprint-state.json + dashboard + progress.txt + problem-statement.md
+    [ ] Problem statement alignment assessed (user journey coverage, criteria satisfaction, implied features)
+    [ ] RETROSPECTIVE_REPORT generated (what worked, what failed, patterns, problem alignment)
     [ ] progress.txt updated with sprint learnings
     [ ] Failure pattern database updated (.claude/failure-patterns.json — new + updated patterns)
     [ ] CLAUDE.md suggestions presented to user (applied only with approval)
@@ -3369,6 +4262,7 @@ echo "Cleanup complete."
 [ ] Sprint cleanup
     [ ] All worktrees removed
     [ ] Stale branches pruned
+    [ ] Lingering dev servers killed (DEV_PID + orphaned port processes)
     [ ] Sprint dashboard finalized (final status)
     [ ] sprint-state.json archived
     [ ] Sprint summary logged
@@ -3393,7 +4287,7 @@ BUILD_CMD: "npm run build"
 LINT_CMD: "npm run lint"
 TEST_CMD: "npm run test:run"
 TYPECHECK_CMD: "npx tsc --noEmit"
-E2E_CMD: "npx playwright test"
+E2E_CMD: "npx playwright test"           # Existing test runner (Phase 6 Step 2); agent-browser handles Step 3
 COMMIT_PREFIX: "feat"
 MAX_LOOP_ITERATIONS: 3
 HUMAN_IN_LOOP: false

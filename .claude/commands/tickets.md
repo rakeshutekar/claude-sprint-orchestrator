@@ -130,6 +130,151 @@ If the user doesn't provide config, use the defaults above and ask only for FEAT
 
 ## PHASE 0: PRE-FLIGHT
 
+### Step 0-Pre: Load Problem Statement (from /define)
+
+Check if `/define` was run before this command. Validate schema, required sections, and freshness.
+
+```bash
+if [ -f .claude/problem-statement.md ]; then
+  echo "📋 Found problem statement from /define. Loading..."
+  PROBLEM_STATEMENT = read .claude/problem-statement.md
+
+  # ─── SCHEMA VALIDATION ───
+  # Required header fields (added in schema_version 2):
+  schema_version = extract "schema_version:" from header line
+  generated_at = extract "generated_at:" from header line
+  generated_commit = extract "generated_commit:" from header line
+
+  if schema_version is missing or < 2:
+      echo "⚠️  Problem statement has old or missing schema_version (found: ${schema_version:-'none'})."
+      echo "    Expected schema_version: 2. Re-run /define to regenerate."
+      echo "    Proceeding with best-effort extraction — some fields may be missing."
+      PROBLEM_STATEMENT_SCHEMA_VALID = false
+  else:
+      PROBLEM_STATEMENT_SCHEMA_VALID = true
+  fi
+
+  # ─── REQUIRED SECTIONS VALIDATION ───
+  # These sections MUST exist for /tickets to function correctly.
+  # Use heading detection: grep for "^## {heading}" (case-insensitive).
+  REQUIRED_SECTIONS = ["Problem", "Definition of Done", "Testing Strategy", "Constraints"]
+  missing_sections = []
+
+  for section in REQUIRED_SECTIONS:
+      if ! grep -qi "^## ${section}" .claude/problem-statement.md; then
+          missing_sections.append(section)
+      fi
+  done
+
+  if missing_sections is not empty:
+      echo "⚠️  Problem statement is missing required sections: ${missing_sections}"
+      echo "    These sections are needed for ticket generation. Re-run /define to fix."
+      echo "    Proceeding with available sections — quality may be reduced."
+  fi
+
+  # ─── SUB-SECTION VALIDATION ───
+  # Key sub-sections that downstream consumers depend on:
+  EXPECTED_SUBSECTIONS = ["User Journey", "Success Criteria", "Implied Features", "Codebase Snapshot"]
+  missing_subsections = []
+
+  for subsection in EXPECTED_SUBSECTIONS:
+      if ! grep -qi "^### ${subsection}" .claude/problem-statement.md; then
+          missing_subsections.append(subsection)
+      fi
+  done
+
+  if missing_subsections is not empty:
+      echo "    Note: Missing sub-sections: ${missing_subsections} (non-blocking but reduces quality)"
+  fi
+
+  # ─── STALENESS CHECK ───
+  # Compare the commit SHA when /define ran against current HEAD.
+  # If the codebase changed significantly, the problem statement's Codebase Snapshot
+  # may be outdated (new modules, changed test infra, etc.).
+  if generated_commit is not empty:
+      current_head=$(git rev-parse HEAD)
+      if [ "$generated_commit" != "$current_head" ]; then
+          # Count how many commits apart we are
+          commits_apart=$(git rev-list --count ${generated_commit}..HEAD 2>/dev/null || echo "unknown")
+          echo "⚠️  STALE PROBLEM STATEMENT: /define ran at ${generated_commit:0:7}, HEAD is now ${current_head:0:7}"
+          echo "    ${commits_apart} commits apart. The Codebase Snapshot may be outdated."
+          echo "    Consider re-running /define if the codebase changed significantly."
+          PROBLEM_STATEMENT_STALE = true
+      else
+          PROBLEM_STATEMENT_STALE = false
+      fi
+  else
+      echo "    Note: No generated_commit in problem statement (pre-v2 format). Cannot check staleness."
+      PROBLEM_STATEMENT_STALE = "unknown"
+  fi
+
+  # ─── EXTRACT KEY FIELDS ───
+  # These are used throughout /tickets:
+  # - PROBLEM_DESCRIPTION: Enriches FEATURE context beyond the one-liner
+  # - SUCCESS_CRITERIA: Used in Phase 3 (Approval Gate) to validate all criteria have tickets
+  # - USER_JOURNEY: Used in Phase 2.75 to generate more targeted edge cases
+  # - TESTING_STRATEGY: Used to set test expectations per ticket
+  # - IMPLIED_FEATURES: Cross-checked against generated ticket list
+  # - CONSTRAINTS: Passed to Context Agents as hard constraints
+  # - CODEBASE_SNAPSHOT: Accelerates Phase 1 (Explore Agent already knows the stack)
+  #
+  # PARSING STRATEGY: Extract each section by finding its ## heading and reading
+  # until the next ## heading (or end of file). See Step 0-Pre Parsing Helper below.
+
+  echo "  Problem: $(head -n1 of Problem section)"
+  echo "  Success criteria: {N} items"
+  echo "  Testing level: {level}"
+  echo "  Constraints: {count or 'none'}"
+  echo "  Schema valid: ${PROBLEM_STATEMENT_SCHEMA_VALID}"
+  echo "  Stale: ${PROBLEM_STATEMENT_STALE}"
+  echo ""
+  echo "Tip: /define context will enrich ticket quality. The Explore Agent will"
+  echo "     skip basic stack detection since /define already captured it."
+else
+  echo "ℹ️  No problem statement found. Running without /define context."
+  echo "   Tip: Run /define first for better ticket quality."
+  PROBLEM_STATEMENT = null
+fi
+```
+
+#### Step 0-Pre Parsing Helper
+
+To extract sections from the markdown problem statement, use this heading-based parser:
+
+```bash
+# Extract a section from problem-statement.md by its heading.
+# Returns everything from "## {heading}" to the next "## " heading (or EOF).
+# Usage: extract_section "Problem" → returns the Problem section content
+#        extract_section "User Journey" → returns the User Journey subsection
+
+extract_section() {
+    local heading="$1"
+    local file=".claude/problem-statement.md"
+    # Case-insensitive match on heading, capture until next heading of same or higher level
+    awk -v heading="$heading" '
+        BEGIN { IGNORECASE=1; found=0; level=0 }
+        /^##/ {
+            if (found) { exit }
+            if (index(tolower($0), tolower(heading)) > 0) {
+                found=1
+                level=gsub(/#/, "#", $1)
+                next
+            }
+        }
+        found { print }
+    ' "$file"
+}
+
+# Example usage throughout /tickets:
+# PROBLEM_DESCRIPTION=$(extract_section "Problem")
+# USER_JOURNEY=$(extract_section "User Journey")
+# SUCCESS_CRITERIA=$(extract_section "Success Criteria")
+# IMPLIED_FEATURES=$(extract_section "Implied Features")
+# TESTING_STRATEGY=$(extract_section "Testing Strategy")
+# CONSTRAINTS=$(extract_section "Constraints")
+# CODEBASE_SNAPSHOT=$(extract_section "Codebase Snapshot")
+```
+
 ### Step 0A: Check Linear MCP
 ```
 Fetch one issue from LINEAR_TEAM using Linear MCP tools.
@@ -175,6 +320,7 @@ git check-ignore -q .claude/worktrees/ 2>/dev/null || echo ".claude/worktrees/" 
 # Ensure sprint dashboard and state files are gitignored
 git check-ignore -q .claude/sprint-dashboard.md 2>/dev/null || echo ".claude/sprint-dashboard.md" >> .gitignore
 git check-ignore -q .claude/sprint-state.json 2>/dev/null || echo ".claude/sprint-state.json" >> .gitignore
+git check-ignore -q .claude/problem-statement.md 2>/dev/null || echo ".claude/problem-statement.md" >> .gitignore
 ```
 
 ---
@@ -218,8 +364,44 @@ After completing your analysis, UPDATE your agent memory:
 
 Analyze the codebase for implementing: "{FEATURE}"
 
+## Problem Statement Context (from /define)
+{IF PROBLEM_STATEMENT is not null:
+  The orchestrator extracts each section using the extract_section() parser from Step 0-Pre.
+  PASTE these extracted sections into this prompt:
+
+  ### Problem
+  {extract_section("Problem")}
+
+  ### User Journey
+  {extract_section("User Journey")}
+  → Focus your codebase analysis on the files/modules these journey steps will touch.
+
+  ### Constraints
+  {extract_section("Constraints")}
+  → Treat these as hard limits when mapping implementation paths.
+
+  ### Codebase Snapshot
+  {extract_section("Codebase Snapshot")}
+  → Skip re-discovering stack, test infra, and directory structure — this is already known.
+    Focus your analysis time on code-level patterns, function signatures, and test conventions.
+
+  {IF PROBLEM_STATEMENT_STALE == true:
+    ⚠️  NOTE: This problem statement is {commits_apart} commits behind HEAD.
+    The Codebase Snapshot may be outdated. Verify any stack/infra claims during your analysis.
+  }
+}
+{IF PROBLEM_STATEMENT is null:
+  No problem statement available. Analyze broadly based on FEATURE description.
+}
+
 ## What to Map
 1. ARCHITECTURE — project structure, key directories, framework/stack used
+   {IF Codebase Snapshot section was provided above:
+     SKIP basic stack detection (language, framework, key deps, directory structure).
+     The Codebase Snapshot already provides: stack, test infra, key dirs, auth/db/API presence.
+     Instead, go DEEPER: analyze code-level architecture patterns, module boundaries,
+     service layers, and how the existing modules communicate.
+   }
 2. EXISTING CODE — modules/services/components that relate to this feature
    For each file: show file path, function signatures with FULL type signatures, line counts.
    Use EVIDENCE FORMAT for every file you report on.
@@ -651,7 +833,53 @@ Present the full plan to the user. Display:
 6. **Complexity changes** — any tickets that were split or resized in Phase 2.75C
 7. **Rollback plans** — count of tickets with rollback specs
 8. **Unverified items** — any remaining [UNVERIFIED] references (should be 0)
-9. **Sprint config** — the exact `/sprint` config that will be generated
+9. **Problem statement coverage** (if PROBLEM_STATEMENT loaded) — validate using keyword matching:
+
+   **Algorithm: Keyword Extraction + Ticket Scanning**
+   ```
+   For each success_criterion in SUCCESS_CRITERIA:
+       # Step 1: Extract 2-3 unique keywords from the criterion
+       #   "Notification bell renders in top nav with unread count"
+       #   → keywords: ["notification bell", "unread count"]
+       keywords = extract_nouns_and_key_phrases(criterion)
+
+       # Step 2: Search all ticket titles + descriptions for keyword matches
+       matched_tickets = []
+       for ticket in ALL_TICKETS:
+           ticket_text = ticket.title + " " + ticket.description
+           match_count = count keywords present in ticket_text (case-insensitive)
+           if match_count >= 1:
+               matched_tickets.append(ticket.id)
+
+       # Step 3: Report
+       if matched_tickets is empty:
+           FLAG: "⚠️ UNCOVERED: '{criterion}' — no ticket matches keywords {keywords}"
+       else:
+           LOG: "✓ '{criterion}' covered by: {matched_tickets}"
+   ```
+
+   **For implied features:**
+   ```
+   For each implied_feature in IMPLIED_FEATURES:
+       # Implied features are more specific (e.g., "Mark-as-read mutation")
+       # Search ticket titles for direct substring match (case-insensitive)
+       matched = find tickets where title contains any word from implied_feature (3+ chars)
+       if not matched:
+           FLAG: "⚠️ UNCOVERED: Implied feature '{implied_feature}' has no corresponding ticket"
+   ```
+
+   **For testing strategy:**
+   - If testing level is "Full" → every ticket MUST have an E2E scenario or a note explaining why not
+   - If testing level is "Standard" → every ticket MUST have unit test expectations
+   - If testing level is "Minimal" → at least core logic tickets must have test expectations
+
+   **For constraints:**
+   - For each constraint, grep all ticket descriptions for violation keywords
+   - E.g., constraint "Must NOT touch auth module" → check no ticket's files_to_modify includes auth/
+
+   **If ANY success criterion is UNCOVERED:** present the gaps to the user in the approval prompt.
+   The user can choose to add tickets, modify existing tickets, or accept the gaps.
+10. **Sprint config** — the exact `/sprint` config that will be generated
 
 Then ask:
 
@@ -1238,6 +1466,12 @@ Or tell me: "delete the tickets you just created"
 Before presenting to user at Phase 3, verify:
 
 ```
+[ ] Step 0-Pre: Problem statement loaded (if exists)
+    [ ] Schema version validated (≥2 expected)
+    [ ] Required sections present (Problem, Definition of Done, Testing Strategy, Constraints)
+    [ ] Sub-sections present (User Journey, Success Criteria, Implied Features, Codebase Snapshot)
+    [ ] Staleness checked (generated_commit vs current HEAD)
+    [ ] extract_section() parser available for downstream steps
 [ ] Phase 0: Linear MCP connected, git clean, baseline build passes
 [ ] Phase 0: progress.txt initialized (or already exists)
 [ ] Phase 0: .claude/agent-memory/tickets-explore/ directory created
