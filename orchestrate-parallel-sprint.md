@@ -114,6 +114,15 @@ echo ".claude/worktrees/" >> .gitignore && git add .gitignore && git commit -m "
 
 ```
 ┌─────────────────────────────────────────────────────────────────────┐
+│                  STEP 0-PRE: CONTEXT PRE-FLIGHT                     │
+│  Estimate remaining context window                                  │
+│  If <60%: prompt user → [Compact+Continue / Proceed / Cancel]       │
+│  Compact: save state to sprint-preflight.json → compact → reload    │
+│  If ≥60%: skip silently                                             │
+└───────────────────────────────┬─────────────────────────────────────┘
+                                │
+                                ▼
+┌─────────────────────────────────────────────────────────────────────┐
 │                        PHASE 0: PRE-FLIGHT                          │
 │  Check Linear → Pull base → Build baseline → Tag snapshot           │
 │  Choose coordination mode (Subagents vs Agent Teams)                │
@@ -471,6 +480,193 @@ With the buffer, Ticket B's Worker reads the learning and avoids the error entir
 
 Before spawning any agents, run these checks SEQUENTIALLY. Stop on first failure.
 
+### Step 0-Pre: Context Pre-Flight Check
+
+**This MUST run before anything else.** Estimate the remaining context window and prompt
+the user if it's too low to safely run a full sprint.
+
+**How to estimate context usage:**
+```bash
+# Heuristic: count approximate tokens in the current conversation
+# Claude's context window is ~200K tokens. We want ≥60% remaining (~120K tokens free).
+# Check conversation length, compaction history, and loaded context as signals.
+
+# Signal 1: Has a compaction already happened in this session?
+#   If yes → we've already lost context. Yellow/Red zone likely.
+# Signal 2: Rough token estimate from conversation transcript length
+# Signal 3: Can you recall the FULL config block and all orchestrator rules without re-reading?
+#   If anything feels fuzzy → context is degraded.
+```
+
+**Threshold: 60% remaining context.**
+
+If the orchestrator estimates it has **less than 60% context remaining**, present this prompt
+to the user (similar to how /plan asks for approval):
+
+```
+═══════════════════════════════════════════════════════════════
+⚠️  CONTEXT PRE-FLIGHT CHECK
+═══════════════════════════════════════════════════════════════
+
+Estimated context remaining: ~{X}%
+A full sprint typically requires ≥60% to avoid mid-sprint degradation
+(agent spawning, verification loops, and merge scheduling are context-heavy).
+
+Options:
+  [1] Compact and continue — Save all state to disk, compact, then resume sprint
+  [2] Proceed as-is — I understand the risk (small sprints may be fine)
+  [3] Cancel — I'll start a fresh session instead
+
+Choose [1/2/3]:
+═══════════════════════════════════════════════════════════════
+```
+
+**If user chooses [1] — Compact and Continue:**
+
+Before compacting, the orchestrator MUST dump ALL parsed state to `.claude/sprint-preflight.json`.
+This file is the checkpoint that makes compaction lossless.
+
+```bash
+# 1. Run Step 0A through 0F.5 FIRST (parse everything before saving)
+#    This ensures we have all config, hints, failure patterns, etc. loaded
+
+# 2. Write sprint-preflight.json with everything parsed so far
+cat > .claude/sprint-preflight.json << 'PREFLIGHTEOF'
+{
+  "version": 1,
+  "created_at": "{ISO-8601 timestamp}",
+  "created_by": "sprint-preflight",
+  "expires_after_minutes": 5,
+
+  "config": {
+    "BRANCH_BASE": "{value}",
+    "LINEAR_FILTER": { "team": "{value}", "label": "{value}", "status": ["{values}"] },
+    "PROJECT_STANDARDS": "{value}",
+    "BUILD_CMD": "{value}",
+    "LINT_CMD": "{value}",
+    "TEST_CMD": "{value}",
+    "TYPECHECK_CMD": "{value or null}",
+    "E2E_CMD": "{value or null}",
+    "COMMIT_PREFIX": "{value}",
+    "MAX_LOOP_ITERATIONS": "{value}",
+    "HUMAN_IN_LOOP": "{value}",
+    "PARTIAL_MERGE": "{value}",
+    "SPRINT_DASHBOARD": "{value}"
+  },
+
+  "sprint_hints": {
+    "loaded": true,
+    "plan_commit": "{SHA or null}",
+    "tickets": ["{ticket objects from sprint-hints.json}"],
+    "total_tickets": "{N}",
+    "coordination_mode_recommendation": "{Agent Teams or Subagents}",
+    "stale": false
+  },
+
+  "failure_patterns": {
+    "loaded": true,
+    "pattern_count": "{N}",
+    "high_frequency_patterns": ["{patterns with frequency ≥3}"]
+  },
+
+  "git_state": {
+    "branch_base": "{BRANCH_BASE}",
+    "safety_tag": "sprint-start-{timestamp}",
+    "head_sha": "{current HEAD SHA}"
+  },
+
+  "pre_flight_completed": {
+    "linear_connected": true,
+    "git_clean": true,
+    "baseline_build_passed": true,
+    "worktrees_verified": true,
+    "progress_txt_initialized": true
+  },
+
+  "resume_instructions": "Load this file, skip Step 0A-0F.5, re-read orchestrate-parallel-sprint.md for behavioral rules, then proceed directly to Step 0G (coordination mode) or Phase 1."
+}
+PREFLIGHTEOF
+
+# 3. Ensure sprint-preflight.json is gitignored
+git check-ignore -q .claude/sprint-preflight.json 2>/dev/null || echo ".claude/sprint-preflight.json" >> .gitignore
+
+# 4. Tell the user what's happening
+echo "✅ Sprint state saved to .claude/sprint-preflight.json"
+echo "   Compacting context now. Sprint will resume automatically after compaction."
+
+# 5. Trigger compaction (the orchestrator compacts itself)
+# After compaction, the orchestrator's FIRST actions are:
+#   a. Re-read orchestrate-parallel-sprint.md (reload behavioral rules)
+#   b. Check for .claude/sprint-preflight.json
+#   c. If found AND not stale (< 5 minutes old):
+#      - Load all state from the file
+#      - Skip Steps 0A through 0F.5 (already completed)
+#      - Delete the file (prevent stale reuse)
+#      - Proceed to coordination mode selection or Phase 1
+#   d. If stale or missing:
+#      - Run full Step 0 from scratch (safe fallback)
+```
+
+**If user chooses [2] — Proceed as-is:**
+```
+Log: "⚠️ User chose to proceed with ~{X}% context remaining. Sprint may degrade."
+Continue with Step 0A normally.
+The self-health monitoring at 70% (Rule 35) will still catch mid-sprint degradation.
+```
+
+**If user chooses [3] — Cancel:**
+```
+echo "Sprint cancelled. Start a fresh Claude Code session and re-invoke /sprint."
+STOP.
+```
+
+**If context is ≥60% remaining:** Skip this check entirely. Proceed silently to Step 0A.
+The user never sees this gate when context is healthy.
+
+### Step 0-Pre-Resume: Check for Sprint Pre-Flight Checkpoint
+
+**This runs immediately after any compaction.** If `sprint-preflight.json` exists, the
+orchestrator can skip re-parsing and jump ahead.
+
+```bash
+if [ -f .claude/sprint-preflight.json ]; then
+  # Validate freshness (must be < 5 minutes old)
+  created_at=$(jq -r '.created_at' .claude/sprint-preflight.json)
+  age_seconds=$(($(date +%s) - $(date -d "$created_at" +%s 2>/dev/null || echo 0)))
+
+  if [ "$age_seconds" -lt 300 ] && [ "$age_seconds" -gt 0 ]; then
+    echo "🔄 Found fresh sprint-preflight.json (${age_seconds}s old). Resuming sprint..."
+    echo "   Skipping Steps 0A-0F.5 (already completed before compaction)."
+
+    # Load all state from preflight file
+    CONFIG = read .claude/sprint-preflight.json → config
+    SPRINT_HINTS = read .claude/sprint-preflight.json → sprint_hints
+    FAILURE_PATTERNS = read .claude/failure-patterns.json  # re-read from disk (authoritative)
+    GIT_STATE = read .claude/sprint-preflight.json → git_state
+    PRE_FLIGHT = read .claude/sprint-preflight.json → pre_flight_completed
+
+    # Verify git state hasn't changed during compaction
+    current_head=$(git rev-parse HEAD)
+    if [ "$current_head" != "{GIT_STATE.head_sha}" ]; then
+      echo "⚠️ HEAD moved during compaction. Running full pre-flight."
+      rm .claude/sprint-preflight.json
+      # Fall through to Step 0A
+    else
+      # Clean up — delete preflight file to prevent stale reuse
+      rm .claude/sprint-preflight.json
+      echo "✅ State restored. Proceeding to Phase 1 (or coordination mode selection)."
+      # SKIP to Step 0G (coordination mode) or Phase 1
+    fi
+  else
+    echo "⚠️ sprint-preflight.json is stale (${age_seconds}s old). Ignoring."
+    rm .claude/sprint-preflight.json
+    # Fall through to Step 0A (full pre-flight)
+  fi
+fi
+```
+
+---
+
 ### Step 0A: Check Linear Connectivity
 ```
 Use Linear MCP tools to fetch one ticket from the configured team.
@@ -515,6 +711,7 @@ fi
 git check-ignore -q .claude/sprint-dashboard.md 2>/dev/null || echo ".claude/sprint-dashboard.md" >> .gitignore
 git check-ignore -q .claude/sprint-state.json 2>/dev/null || echo ".claude/sprint-state.json" >> .gitignore
 git check-ignore -q .claude/sprint-hints.json 2>/dev/null || echo ".claude/sprint-hints.json" >> .gitignore
+git check-ignore -q .claude/sprint-preflight.json 2>/dev/null || echo ".claude/sprint-preflight.json" >> .gitignore
 
 # 3. Commit gitignore changes if any
 if ! git diff --quiet .gitignore 2>/dev/null; then
@@ -3368,6 +3565,12 @@ echo "Cleanup complete."
 ## EXECUTION CHECKLIST
 
 ```
+[ ] Step 0-Pre: Context Pre-Flight Check
+    [ ] Context window estimated (≥60% remaining?)
+    [ ] If <60%: user prompted with [Compact+Continue / Proceed / Cancel]
+    [ ] If Compact: Steps 0A-0F.5 run, sprint-preflight.json written, compaction triggered
+    [ ] If Resume: sprint-preflight.json loaded, freshness validated, state restored
+
 [ ] Phase 0: Pre-flight
     [ ] Linear MCP connected and authenticated
     [ ] Base branch clean and up-to-date

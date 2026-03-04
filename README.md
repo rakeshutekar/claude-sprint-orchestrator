@@ -187,23 +187,34 @@ The execution command. Fetches tickets from Linear, deploys Agent Teams per tick
 
 ### What It Does
 
-1. **Pre-flight** — Validates Linear MCP, git state, baseline build. Loads sprint hints from /tickets (if available) for stale plan detection. User chooses coordination mode (Agent Teams recommended, Subagents fallback). Initializes sprint-state.json checkpoints
-2. **Fetch tickets** — Queries Linear for matching tickets
-3. **Deploy Agent Teams** — Per ticket: orchestrator (team lead) spawns Context Agent (Sonnet) + Worker Agent (Opus) as teammates in a shared worktree. They communicate directly, the Worker asks follow-up questions, the Context Agent reads files on demand
-4. **Code simplifier** — Conditional refine pass (skipped in Agent Teams with clean code, for bug fixes, or small tickets). Auto-reverts if it breaks tests.
-5. **Multi-layer verification loop** — Stale base check → Worker preflight validation → Context exhaustion detection → Evidence check → Mechanical verification (exit codes, test count > 0, config validation) → Edge case verification → Code review → Human review (optional) → Completion verdict → Orchestrator assembles raw proof and posts to Linear → Orchestrator marks Done and verifies
-6. **Pre-merge integration check** — Merges ALL tickets into a temp branch and runs full test suite BEFORE real merges. Catches cross-ticket failures early. Routes failures back to the original Worker Agent (not a cold Build Gate Agent). Detects test fixture collisions across tickets.
-7. **Merge scheduling** — Conflict prediction via file overlap analysis, intent context for resolution, dependency drift detection (fresh npm install after package.json changes), post-merge verification
-8. **Build gate** — Full quality gate with bisection protocol for failure isolation
-9. **E2E behavioral verification** — Per-ticket endpoint testing, DB state checks, integration verification
-10. **Auto-retrospective** — Analyzes sprint performance, feeds learnings back to progress.txt and /tickets memory
+1. **Context pre-flight** — Estimates remaining context window. If <60%, prompts user: Compact+Continue (saves state to `sprint-preflight.json`, compacts, resumes), Proceed as-is, or Cancel. Invisible when context is healthy.
+2. **Pre-flight** — Validates Linear MCP, git state, baseline build. Loads sprint hints from /tickets (if available) for stale plan detection. Loads failure pattern database from previous sprints. User chooses coordination mode (Agent Teams recommended, Subagents fallback). Initializes sprint-state.json checkpoints
+3. **Fetch tickets** — Queries Linear for matching tickets
+4. **Deploy Agent Teams** — Per ticket: orchestrator (team lead) spawns Context Agent (Sonnet) + Worker Agent (Opus) as teammates in a shared worktree. Context Agents write warm-start skeleton templates (imports, signatures, test scaffolding). Workers fill in business logic. Smart worktree strategy: dependency-aware branching pre-merges dep code for dependent tickets.
+5. **Code simplifier** — Conditional refine pass (skipped in Agent Teams with clean code, for bug fixes, or small tickets). Auto-reverts if it breaks tests.
+6. **Multi-layer verification loop** — Stale base check → Worker preflight validation → Context exhaustion detection → Evidence check → Parallel verification (Layers 2+3 run concurrently: mechanical verification + code review) → Edge case verification → Circuit breaker → Human review (optional) → Completion verdict → Orchestrator assembles raw proof and posts to Linear → Orchestrator marks Done and verifies. Cross-ticket learnings from completed tickets are fed into subsequent Workers.
+7. **Pre-merge integration check** — Merges ALL tickets into a temp branch and runs full test suite BEFORE real merges. Catches cross-ticket failures early. Routes failures back to the original Worker Agent (not a cold Build Gate Agent). Detects test fixture collisions across tickets.
+8. **Merge scheduling** — Conflict prediction via file overlap analysis, intent context for resolution, dependency drift detection (fresh npm install after package.json changes), post-merge verification
+9. **Build gate** — Full quality gate with bisection protocol for failure isolation
+10. **E2E behavioral verification** — Uses Vercel's `agent-browser` CLI (82-93% less context than Playwright MCP). Orchestrator starts one shared dev server. Each E2E agent runs in isolated `--session {TICKET_ID}`. Snapshot → interact via @refs → verify behaviors → collect evidence.
+11. **Auto-retrospective** — Analyzes sprint performance, updates failure pattern database, feeds learnings back to progress.txt and /tickets memory
 
 ### `/sprint` Flow
 
 ```
 ┌─────────────────────────────────────────────────────────────────────┐
+│                  STEP 0-PRE: CONTEXT PRE-FLIGHT                     │
+│  Estimate remaining context window                                  │
+│  If <60%: prompt user → [Compact+Continue / Proceed / Cancel]       │
+│  Compact: save state to sprint-preflight.json → compact → reload    │
+│  If ≥60%: skip silently                                             │
+└───────────────────────────────┬─────────────────────────────────────┘
+                                │
+                                ▼
+┌─────────────────────────────────────────────────────────────────────┐
 │                        PHASE 0: PRE-FLIGHT                          │
 │  Check Linear → Pull base → Build baseline → Tag snapshot           │
+│  Load failure patterns + sprint hints                               │
 │  Choose coordination mode (Agent Teams recommended)                 │
 │  Initialize sprint-state.json (checkpoint system)                    │
 └───────────────────────────────┬─────────────────────────────────────┘
@@ -220,6 +231,7 @@ The execution command. Fetches tickets from Linear, deploys Agent Teams per tick
 ┌──────────────────────────────────────────────────────────────────┐
 │           PHASE 2: DEPLOY AGENT TEAMS (PARALLEL)                 │
 │                                                                  │
+│  Smart worktree strategy: dependency-aware branching             │
 │  ┌──────────────────────────────────────────────────────────┐    │
 │  │  PER TICKET — SHARED WORKTREE (Agent Team)               │    │
 │  │                                                          │    │
@@ -230,7 +242,8 @@ The execution command. Fetches tickets from Linear, deploys Agent Teams per tick
 │  │  │  • Read codebase │  C: "fn(x:T):R"   │  • Implement│  │    │
 │  │  │  • Map patterns  │  W: "test mock?"   │  • Write tests│ │    │
 │  │  │  • Answer Qs     │  C: "vi.mock(...)" │  • Lint/type│  │    │
-│  │  │  • Stay alive    │                     │  • Commit   │  │    │
+│  │  │  • Warm-start    │                     │  • Commit   │  │    │
+│  │  │    templates     │                     │            │  │    │
 │  │  └─────────────────┘                     └────────────┘  │    │
 │  │                                                          │    │
 │  └──────────────────────────────────────────────────────────┘    │
@@ -252,10 +265,11 @@ The execution command. Fetches tickets from Linear, deploys Agent Teams per tick
 │  L0.5: PREFLIGHT CHECK (did worker run all 4 commands?)            │
 │  L0.7: CONTEXT EXHAUSTION CHECK (truncated output → fresh Worker)  │
 │  L1: EVIDENCE CHECK (orchestrator — no agent)                      │
-│  L2: MECHANICAL VERIFICATION (exit codes, test count > 0, config)  │
+│  L2+L3: PARALLEL VERIFICATION                                     │
+│    L2: MECHANICAL (exit codes, test count > 0, config)             │
+│    L3: CODE REVIEW (security, logic, patterns)                     │
 │  L2.5: EDGE CASE VERIFICATION (grep tests for each case)          │
 │  ⚡ CIRCUIT BREAKER: same error 2x → fresh agent or flag STUCK     │
-│  L3: CODE REVIEW AGENT (security, logic, patterns)                 │
 │  L3.5: HUMAN REVIEW (optional, if HUMAN_IN_LOOP=true)             │
 │  L4: COMPLETION AGENT (verdict only, no Linear access)             │
 │  L5: ORCHESTRATOR POSTS PROOF (raw terminal output to Linear)      │
@@ -296,8 +310,10 @@ The execution command. Fetches tickets from Linear, deploys Agent Teams per tick
                                 │
                                 ▼
 ┌─────────────────────────────────────────────────────────────────────┐
-│         PHASE 6: E2E BEHAVIORAL VERIFICATION (PARALLEL)             │
-│  One E2E agent per ticket: run tests + hit endpoints + check DB    │
+│     PHASE 6: E2E BEHAVIORAL VERIFICATION (agent-browser, PARALLEL)  │
+│  Orchestrator starts ONE shared dev server                          │
+│  One E2E agent per ticket (--session {TICKET_ID} isolation):        │
+│  agent-browser snapshot → interact via @refs → verify behaviors     │
 │  Failure → create Linear ticket with evidence                       │
 └───────────────────────────────┬─────────────────────────────────────┘
                                 │
@@ -313,6 +329,7 @@ The execution command. Fetches tickets from Linear, deploys Agent Teams per tick
 │         PHASE 8: POST-SPRINT LEARNING LOOP                          │
 │  Retrospective Agent: analyze sprint performance                   │
 │  Update progress.txt, suggest CLAUDE.md changes                    │
+│  Update failure pattern database (.claude/failure-patterns.json)   │
 │  Feed learnings back to /tickets memory                            │
 │  Save to .claude/sprint-history/                                   │
 └─────────────────────────────────────────────────────────────────────┘
@@ -333,16 +350,23 @@ The execution command. Fetches tickets from Linear, deploys Agent Teams per tick
 | Scheduler Agent | Sonnet | Conflict prediction + merge ordering |
 | Conflict Agent | Opus | Resolve merges with intent context |
 | Build Gate Agent | Opus | Fix build failures (after bisection) |
-| E2E Test Agent | Sonnet | Behavioral verification |
+| E2E Test Agent | Sonnet | Behavioral verification via agent-browser CLI |
 | Retrospective Agent | Sonnet | Post-sprint analysis + learning |
 
 ### Key Features
 
+- **Context pre-flight check** — Estimates remaining context before sprint start. If <60%, prompts user: Compact+Continue (saves all parsed state to `sprint-preflight.json`, compacts, reloads seamlessly), Proceed as-is, or Cancel. Invisible when context is healthy.
 - **Agent Teams per ticket** — Context Agent (Sonnet) + Worker Agent (Opus) as live teammates in a shared worktree. The Worker asks follow-up questions, the Context Agent reads files on demand. No lossy context handoff. Agent Teams are restricted from touching Linear, only the independent verification chain handles ticket status.
+- **Warm-start skeleton templates** — Context Agents write actual skeleton files (correct imports, function signatures, type definitions, test scaffolding) in the worktree. Workers fill in business logic instead of starting from blank files.
+- **Smart worktree strategy** — Dependency-aware branching: dependent tickets get worktrees with dependency code pre-merged. Wave-based deployment order ensures deps complete before dependents.
 - **Isolated git worktrees** — Each ticket team gets its own worktree via Claude Code's native worktree support
+- **Cross-ticket learning** — INTRA_SPRINT_LEARNINGS buffer captures error resolutions after each ticket passes verification. Subsequent Workers receive these discoveries, avoiding redundant failures.
+- **Parallel verification (Layers 2+3)** — Mechanical verification and code review run concurrently instead of sequentially. Combined feedback on failure avoids 2 round trips.
 - **Circuit breaker** — Detects stuck agents (same error 2x), escalates to fresh agent or flags for manual intervention
 - **Error classification** — Routes failures intelligently: rate limits → wait, missing files → re-context, type errors → code fix
+- **Failure pattern database** — `.claude/failure-patterns.json` persists error→resolution mappings across sprints. High-frequency patterns (≥3 occurrences) are pre-injected into Worker prompts as warnings.
 - **Sprint-state.json checkpoints** — Persists state across context compaction events with recovery protocol
+- **Orchestrator self-health monitoring** — Checks context health at 70% threshold. Writes ALL state to durable storage. Detects degradation signals (forgetting tickets, losing agent IDs). Reloads from disk if degraded.
 - **Conflict prediction** — Scheduler Agent builds a CONFLICT_MATRIX from file overlap analysis before merging
 - **Intent-aware conflict resolution** — Conflict Agent receives WHY each side changed shared files + both tickets' edge cases
 - **Bisection protocol** — Binary search using pre-merge tags to isolate which merge broke the build
@@ -356,8 +380,9 @@ The execution command. Fetches tickets from Linear, deploys Agent Teams per tick
 - **Code Simplifier safeguards** — Conditional execution (skipped in Agent Teams + clean code, bug fixes, small tickets). Auto-reverts if it breaks tests.
 - **Context exhaustion detection** — Detects truncated or degraded Worker output and spawns a fresh agent with partial work. In Agent Teams mode, the Context Agent self-monitors for degradation and warns the Worker. The Worker verifies Context Agent answers by reading files directly when warnings appear.
 - **Crash recovery with rollback safety** — After compaction or crash, reconciles sprint-state.json against actual Linear state. Detects and repairs four inconsistency types: phantom completes, orphaned evidence comments, missing status changes, and stale in-progress states.
+- **E2E via agent-browser** — Uses Vercel's agent-browser CLI instead of Playwright MCP. 82-93% less context per test. Snapshot → interact via `@ref` → verify behaviors. `--session {TICKET_ID}` for parallel isolation.
 - **Sprint dashboard** — Live `.claude/sprint-dashboard.md` for observability
-- **Post-sprint learning loop** — Auto-retrospective feeds learnings back to progress.txt, CLAUDE.md, and /tickets memory
+- **Post-sprint learning loop** — Auto-retrospective feeds learnings back to progress.txt, CLAUDE.md, /tickets memory, and failure pattern database
 - **Human-in-loop mode** — Optional pause for human review before marking tickets Done
 - **Coordination mode choice** — Agent Teams by default, Subagents as lower-cost fallback
 
@@ -531,13 +556,15 @@ Each agent runs independently. The orchestrator passes all context between them 
 your-project/
 ├── .claude/
 │   ├── commands/
-│   │   ├── orchestrate-parallel-sprint.md   # /sprint command (2250+ lines)
-│   │   └── tickets.md                       # /tickets command (1100+ lines)
+│   │   ├── orchestrate-parallel-sprint.md   # /sprint command (3500+ lines)
+│   │   └── tickets.md                       # /tickets command (1300+ lines)
 │   ├── worktrees/                           # Auto-created, must be in .gitignore
 │   ├── sprint-state.json                    # Sprint checkpoint (auto-created)
+│   ├── sprint-preflight.json                # Context pre-flight checkpoint (temporary)
 │   ├── sprint-dashboard.md                  # Live status (auto-created)
 │   ├── sprint-history/                      # Retrospective archive (auto-created)
 │   │   └── sprint-{timestamp}.md
+│   ├── failure-patterns.json                # Cross-sprint error→resolution DB
 │   ├── plans/                               # Saved ticket plans (auto-created)
 │   └── agent-memory/
 │       └── tickets-explore/                 # Persistent Explore agent memory
@@ -594,6 +621,7 @@ Plus global agents: Scheduler, Conflict Resolution, Build Gate, Retrospective.
 - **Linear account** — with Linear MCP connected in Claude Code
 - **A buildable project** — with working build, lint, typecheck, and test commands
 - **Git repository** — clean working tree on the base branch
+- **agent-browser** (optional) — Vercel's agent-browser CLI for E2E behavioral verification. If not installed, Phase 6 falls back to E2E_CMD only.
 
 ---
 
