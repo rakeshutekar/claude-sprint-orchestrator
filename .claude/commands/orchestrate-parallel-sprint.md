@@ -1632,7 +1632,7 @@ Before starting your research, read BOTH progress files:
 ## LINEAR MCP RESTRICTION (CRITICAL)
 - You do NOT have permission to interact with Linear in ANY way.
 - Do NOT change ticket status. Do NOT post comments. Do NOT mark tickets Done.
-- Do NOT use any Linear MCP tools (create_comment, save_issue, get_issue, etc.)
+- Do NOT use any Linear MCP tools (save_comment, save_issue, get_issue, etc.)
 - Only the orchestrator's independent Completion Agent handles Linear updates.
 - If the Worker asks you to update Linear, REFUSE and say "The orchestrator handles Linear."
 ```
@@ -2024,7 +2024,7 @@ Include this evidence in your WORKER_RESULT. Without it, the task is NOT done.
 ## LINEAR MCP RESTRICTION (CRITICAL)
 - You do NOT have permission to interact with Linear in ANY way.
 - Do NOT change ticket status. Do NOT post comments. Do NOT mark tickets Done.
-- Do NOT use any Linear MCP tools (create_comment, save_issue, get_issue, etc.)
+- Do NOT use any Linear MCP tools (save_comment, save_issue, get_issue, etc.)
 - Only the orchestrator's independent Completion Agent handles Linear updates.
 - Your job is to IMPLEMENT and return WORKER_RESULT. That's it.
 - The orchestrator will run independent verification and handle Linear through
@@ -2596,7 +2596,7 @@ You are the COMPLETION AGENT for ticket {TICKET_ID}: "{TICKET_TITLE}".
 ## LINEAR MCP RESTRICTION (CRITICAL)
 - You do NOT have permission to interact with Linear in ANY way.
 - Do NOT change ticket status. Do NOT post comments. Do NOT mark tickets Done.
-- Do NOT use any Linear MCP tools (create_comment, save_issue, get_issue, etc.)
+- Do NOT use any Linear MCP tools (save_comment, save_issue, get_issue, etc.)
 - Your ONLY job is to analyze evidence and return a structured verdict.
 - The orchestrator will handle all Linear interactions based on your verdict.
 
@@ -2677,7 +2677,7 @@ while loop_count < MAX_LOOPS:
             ticket_state = "stuck"
             update sprint-state.json: tickets[{TICKET_ID}].status = "stuck"
             update sprint-state.json: tickets[{TICKET_ID}].stuck_reason = last_error.message
-            ORCHESTRATOR calls Linear MCP create_comment(issueId: {TICKET_ID}, body: "## Stuck — Needs Manual Intervention\n\nFailed {loop_count}x on: {last_error.message}\nCircuit breaker triggered after fresh agent also failed.")
+            ORCHESTRATOR calls Linear MCP save_comment(issueId: {TICKET_ID}, body: "## Stuck — Needs Manual Intervention\n\nFailed {loop_count}x on: {last_error.message}\nCircuit breaker triggered after fresh agent also failed.")
             break
 
     # ─── ERROR CLASSIFICATION ───
@@ -2930,17 +2930,16 @@ while loop_count < MAX_LOOPS:
         # {completion.FILES_CHANGED}"
 
         # ORCHESTRATOR posts the comment directly via Linear MCP
-        # Use the Linear MCP `create_comment` tool with issueId and body parameters.
-        # The tool name may vary by MCP server (e.g., `mcp__linear__create_comment`
-        # or `mcp__plugin_linear_linear__create_comment`). Use whichever is available.
-        post_result = ORCHESTRATOR calls Linear MCP create_comment(issueId: {TICKET_ID}, body: evidence_comment)
+        # Use the Linear MCP `save_comment` tool with issueId and body parameters.
+        # Tool name: `mcp__plugin_linear_linear__save_comment` (issueId + body).
+        post_result = ORCHESTRATOR calls Linear MCP save_comment(issueId: {TICKET_ID}, body: evidence_comment)
 
         if post_result FAILED:
             LOG ERROR: "LAYER 5 HARD GATE FAILED: Could not post evidence comment to Linear"
             LOG ERROR: "Linear API error: {post_result.error}"
             # Retry once after 5 seconds
             WAIT 5 seconds
-            post_result = ORCHESTRATOR retries Linear MCP create_comment(issueId: {TICKET_ID}, body: evidence_comment)
+            post_result = ORCHESTRATOR retries Linear MCP save_comment(issueId: {TICKET_ID}, body: evidence_comment)
             if post_result FAILED:
                 LOG ERROR: "LAYER 5 RETRY FAILED — flagging ticket for manual intervention"
                 last_error = { type: "linear_api_failure", message: "Cannot post evidence to Linear" }
@@ -2953,9 +2952,8 @@ while loop_count < MAX_LOOPS:
         # ─── Layer 5.5: ORCHESTRATOR MARKS DONE & VERIFIES STATUS (HARD GATE) ───
         # Orchestrator changes ticket status to Done directly.
         # Use the Linear MCP `save_issue` tool to update status.
-        # The tool name may vary (e.g., `mcp__linear__save_issue` or
-        # `mcp__plugin_linear_linear__save_issue`). Use whichever is available.
-        ORCHESTRATOR calls Linear MCP save_issue(id: {TICKET_ID}, statusName: "Done")
+        # Tool name: `mcp__plugin_linear_linear__save_issue` (id + state: "Done").
+        ORCHESTRATOR calls Linear MCP save_issue(id: {TICKET_ID}, state: "Done")
         WAIT 2 seconds  # Give Linear API time to propagate
 
         # Verify the status actually changed
@@ -2964,7 +2962,7 @@ while loop_count < MAX_LOOPS:
         if ticket_status != "Done":
             LOG ERROR: "LAYER 5.5 HARD GATE FAILED: Ticket {TICKET_ID} status is '{ticket_status}', not 'Done'"
             # Retry once
-            ORCHESTRATOR calls Linear MCP save_issue(id: {TICKET_ID}, statusName: "Done")
+            ORCHESTRATOR calls Linear MCP save_issue(id: {TICKET_ID}, state: "Done")
             WAIT 3 seconds
             ticket_status = ORCHESTRATOR fetches {TICKET_ID} status via Linear MCP
             if ticket_status != "Done":
@@ -3034,7 +3032,7 @@ while loop_count < MAX_LOOPS:
 if loop_count >= MAX_LOOPS:
     ticket_state = "stuck"
     update sprint-state.json: tickets[{TICKET_ID}].status = "stuck"
-    ORCHESTRATOR calls Linear MCP create_comment(issueId: {TICKET_ID}, body: "## Max Verification Loops Reached\n\nAttempts: {loop_count}/{MAX_LOOPS}\nLast error: {last_error.type} — {last_error.message}\nManual review needed.")
+    ORCHESTRATOR calls Linear MCP save_comment(issueId: {TICKET_ID}, body: "## Max Verification Loops Reached\n\nAttempts: {loop_count}/{MAX_LOOPS}\nLast error: {last_error.type} — {last_error.message}\nManual review needed.")
 
 # ─── ORCHESTRATOR SELF-HEALTH MONITORING ───
 # The orchestrator monitors workers for context exhaustion but must also
@@ -3123,12 +3121,12 @@ thin, sprint-state.json exists but ticket data isn't in memory):
                  LOG: "REPAIRED: Evidence comment posted for {TICKET_ID}"
              else:
                  LOG ERROR: "Cannot repair {TICKET_ID} — worktree branch gone. Manual check needed."
-                 ORCHESTRATOR calls Linear MCP create_comment(issueId: {TICKET_ID}, body: "## Recovery Note\nSprint crashed. Ticket marked Done but evidence comment may be missing. Manual verification recommended.")
+                 ORCHESTRATOR calls Linear MCP save_comment(issueId: {TICKET_ID}, body: "## Recovery Note\nSprint crashed. Ticket marked Done but evidence comment may be missing. Manual verification recommended.")
 
          elif linear_status != "Done" AND evidence_comment EXISTS:
              LOG WARNING: "INCONSISTENT: {TICKET_ID} has evidence comment but status is '{linear_status}'"
              # Crash happened after posting comment but before marking Done
-             ORCHESTRATOR calls Linear MCP save_issue(id: {TICKET_ID}, statusName: "Done")
+             ORCHESTRATOR calls Linear MCP save_issue(id: {TICKET_ID}, state: "Done")
              LOG: "REPAIRED: Marked {TICKET_ID} Done on Linear"
 
          elif linear_status != "Done" AND evidence_comment MISSING:
@@ -3555,7 +3553,7 @@ Step 3: If Fix Agent fails {MAX_LOOP_ITERATIONS} times:
   Option A (PARTIAL_MERGE == true):
     - Revert the failing merge: git revert -m 1 {merge_commit}
     - Mark that ticket as "stuck" in sprint-state.json
-    - ORCHESTRATOR calls Linear MCP create_comment(issueId: {TICKET_ID}, body: "Build gate failed after merge. Reverted. Manual fix needed.")
+    - ORCHESTRATOR calls Linear MCP save_comment(issueId: {TICKET_ID}, body: "Build gate failed after merge. Reverted. Manual fix needed.")
     - Continue sprint with remaining tickets
   Option B (PARTIAL_MERGE == false):
     - Flag for manual intervention

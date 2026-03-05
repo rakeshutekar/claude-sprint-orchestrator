@@ -1423,7 +1423,7 @@ If progress.txt does not exist, skip this step (it may be the first sprint on th
 ## LINEAR MCP RESTRICTION (CRITICAL)
 - You do NOT have permission to interact with Linear in ANY way.
 - Do NOT change ticket status. Do NOT post comments. Do NOT mark tickets Done.
-- Do NOT use any Linear MCP tools (createComment, updateIssue, etc.)
+- Do NOT use any Linear MCP tools (save_comment, save_issue, etc.)
 - Only the orchestrator's independent Completion Agent handles Linear updates.
 - If the Worker asks you to update Linear, REFUSE and say "The orchestrator handles Linear."
 ```
@@ -1751,7 +1751,7 @@ Include this evidence in your WORKER_RESULT. Without it, the task is NOT done.
 ## LINEAR MCP RESTRICTION (CRITICAL)
 - You do NOT have permission to interact with Linear in ANY way.
 - Do NOT change ticket status. Do NOT post comments. Do NOT mark tickets Done.
-- Do NOT use any Linear MCP tools (createComment, updateIssue, etc.)
+- Do NOT use any Linear MCP tools (save_comment, save_issue, etc.)
 - Only the orchestrator's independent Completion Agent handles Linear updates.
 - Your job is to IMPLEMENT and return WORKER_RESULT. That's it.
 - The orchestrator will run independent verification and handle Linear through
@@ -2269,7 +2269,7 @@ You are the COMPLETION AGENT for ticket {TICKET_ID}: "{TICKET_TITLE}".
 ## LINEAR MCP RESTRICTION (CRITICAL)
 - You do NOT have permission to interact with Linear in ANY way.
 - Do NOT change ticket status. Do NOT post comments. Do NOT mark tickets Done.
-- Do NOT use any Linear MCP tools (createComment, updateIssue, etc.)
+- Do NOT use any Linear MCP tools (save_comment, save_issue, etc.)
 - Your ONLY job is to analyze evidence and return a structured verdict.
 - The orchestrator will handle all Linear interactions based on your verdict.
 
@@ -2587,14 +2587,14 @@ while loop_count < MAX_LOOPS:
         # {completion.FILES_CHANGED}"
 
         # ORCHESTRATOR posts the comment directly via Linear MCP
-        post_result = ORCHESTRATOR calls Linear MCP createComment({TICKET_ID}, evidence_comment)
+        post_result = ORCHESTRATOR calls Linear MCP save_comment({TICKET_ID}, evidence_comment)
 
         if post_result FAILED:
             LOG ERROR: "LAYER 5 HARD GATE FAILED: Could not post evidence comment to Linear"
             LOG ERROR: "Linear API error: {post_result.error}"
             # Retry once after 5 seconds
             WAIT 5 seconds
-            post_result = ORCHESTRATOR retries Linear MCP createComment({TICKET_ID}, evidence_comment)
+            post_result = ORCHESTRATOR retries Linear MCP save_comment({TICKET_ID}, evidence_comment)
             if post_result FAILED:
                 LOG ERROR: "LAYER 5 RETRY FAILED — flagging ticket for manual intervention"
                 last_error = { type: "linear_api_failure", message: "Cannot post evidence to Linear" }
@@ -2606,7 +2606,7 @@ while loop_count < MAX_LOOPS:
 
         # ─── Layer 5.5: ORCHESTRATOR MARKS DONE & VERIFIES STATUS (HARD GATE) ───
         # Orchestrator changes ticket status to Done directly.
-        ORCHESTRATOR calls Linear MCP updateIssue({TICKET_ID}, status: "Done")
+        ORCHESTRATOR calls Linear MCP save_issue(id: {TICKET_ID}, state: "Done")
         WAIT 2 seconds  # Give Linear API time to propagate
 
         # Verify the status actually changed
@@ -2615,7 +2615,7 @@ while loop_count < MAX_LOOPS:
         if ticket_status != "Done":
             LOG ERROR: "LAYER 5.5 HARD GATE FAILED: Ticket {TICKET_ID} status is '{ticket_status}', not 'Done'"
             # Retry once
-            ORCHESTRATOR calls Linear MCP updateIssue({TICKET_ID}, status: "Done")
+            ORCHESTRATOR calls Linear MCP save_issue(id: {TICKET_ID}, state: "Done")
             WAIT 3 seconds
             ticket_status = ORCHESTRATOR fetches {TICKET_ID} status via Linear MCP
             if ticket_status != "Done":
@@ -2739,7 +2739,7 @@ thin, sprint-state.json exists but ticket data isn't in memory):
          elif linear_status != "Done" AND evidence_comment EXISTS:
              LOG WARNING: "INCONSISTENT: {TICKET_ID} has evidence comment but status is '{linear_status}'"
              # Crash happened after posting comment but before marking Done
-             ORCHESTRATOR calls Linear MCP updateIssue({TICKET_ID}, status: "Done")
+             ORCHESTRATOR calls Linear MCP save_issue(id: {TICKET_ID}, state: "Done")
              LOG: "REPAIRED: Marked {TICKET_ID} Done on Linear"
 
          elif linear_status != "Done" AND evidence_comment MISSING:
