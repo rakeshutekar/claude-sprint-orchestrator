@@ -376,19 +376,75 @@ step_e2e() {
   local e2e_cmd=$(parse_yaml "e2e_cmd")
 
   if [ -z "$e2e_cmd" ]; then
-    log_warn "No E2E command configured. Skipping."
+    log_warn "No E2E command configured (e2e_cmd is empty). Skipping."
     write_state "phase" "e2e_complete"
     return 0
+  fi
+
+  # Detect agent-browser availability
+  local e2e_prefix=""
+  if command -v agent-browser >/dev/null 2>&1; then
+    e2e_prefix="agent-browser"
+    log_ok "agent-browser CLI found"
+  elif npx agent-browser --version >/dev/null 2>&1; then
+    e2e_prefix="npx agent-browser"
+    log_ok "agent-browser available via npx"
+  else
+    # E2E is configured but agent-browser not available — ask user
+    echo ""
+    echo -e "${RED}═══════════════════════════════════════════════════════════════${NC}"
+    echo -e "${RED}  E2E ENABLED BUT agent-browser NOT FOUND${NC}"
+    echo -e "${RED}═══════════════════════════════════════════════════════════════${NC}"
+    echo ""
+    echo "  Your config has e2e_cmd set, but agent-browser is not installed."
+    echo ""
+    echo "  [1] Install now (npm install -g agent-browser && agent-browser install)"
+    echo "  [2] Skip E2E for this sprint only"
+    echo "  [3] Abort sprint"
+    echo ""
+
+    local choice=""
+    while [[ "$choice" != "1" && "$choice" != "2" && "$choice" != "3" ]]; do
+      read -rp "Choose [1/2/3]: " choice
+    done
+
+    if [ "$choice" = "1" ]; then
+      echo "Install agent-browser and press Enter when done..."
+      read -r
+      if command -v agent-browser >/dev/null 2>&1; then
+        e2e_prefix="agent-browser"
+        log_ok "agent-browser CLI found after install"
+      elif npx agent-browser --version >/dev/null 2>&1; then
+        e2e_prefix="npx agent-browser"
+        log_ok "agent-browser available via npx after install"
+      else
+        log_error "agent-browser still not found. Aborting."
+        return 1
+      fi
+    elif [ "$choice" = "2" ]; then
+      log_warn "E2E skipped for this sprint (user choice). Config unchanged."
+      write_state "phase" "e2e_complete"
+      return 0
+    else
+      log_error "Sprint aborted by user."
+      return 1
+    fi
   fi
 
   run_claude "e2e" "
 You are the E2E verification agent. The sprint code has been merged.
 
+FIRST: Load the agent-browser skill using the Skill tool for canonical
+usage patterns, session management, and timeout handling.
+
+Use '$e2e_prefix' as the command prefix for all agent-browser interactions.
+
 1. Start the dev server: npm run dev &
 2. Wait for it to be ready
 3. Run E2E tests: $e2e_cmd
 4. For each completed ticket (read from progress.txt):
-   - Verify the feature behaviorally (curl endpoints, check DB, check logs)
+   - Verify the feature behaviorally using $e2e_prefix (snapshot, interact, verify)
+   - Also check: curl endpoints, check DB, check logs
 5. If ANY test fails, create a new Linear ticket with:
    - Title: 'Fix: {what failed}'
    - Priority: 2 (High)

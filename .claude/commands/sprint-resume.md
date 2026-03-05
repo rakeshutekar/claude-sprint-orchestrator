@@ -612,16 +612,33 @@ After all merges:
 
 ### Step 6A: E2E Behavioral Verification
 
+**Pre-check: Verify agent-browser availability (same gate as /sprint Step 0F.8).**
+
+If E2E is enabled in config (`phases.e2e: true`), agent-browser MUST be available.
+Check `command -v agent-browser`, then `npx agent-browser --version` as fallback.
+If neither works, prompt the user — do NOT silently skip:
+
+```
+E2E is enabled but agent-browser is not found.
+
+  [1] Install now — npm install -g agent-browser && agent-browser install
+  [2] Skip E2E for this recovery sprint only
+  [3] Abort recovery
+```
+
+If `E2E_PREFIX` was stored in sprint-state.json from the original sprint, reuse it.
+
 Delegates to `/sprint` Phase 6:
 ```
-IF E2E_CMD is configured AND agent-browser is installed:
+IF E2E available (agent-browser or npx agent-browser):
   → Start dev server
   → One E2E agent per newly completed ticket
-  → agent-browser snapshot → interact → verify behaviors
+  → Each E2E agent loads the agent-browser skill first
+  → {E2E_PREFIX} snapshot → interact → verify behaviors
   → Failures create new Linear tickets with evidence
 
-IF E2E not available:
-  → Skip (non-blocking), log warning
+IF user chose to skip E2E:
+  → Skip with explicit user consent logged
 ```
 
 ### Step 6B: Remaining Ticket Check
@@ -904,7 +921,9 @@ Phase 6 E2E + wrap-up        → /sprint Phase 6 through 8
     [ ] sprint-state.json updated with merge_sha values
 
 [ ] Phase 6: E2E & Wrap-Up
-    [ ] E2E verification run (if configured and available)
+    [ ] E2E availability gate checked (hard gate when e2e: true — user prompted if missing)
+    [ ] E2E agents loaded agent-browser skill before browser interactions
+    [ ] E2E verification run (agent-browser or npx agent-browser via E2E_PREFIX)
     [ ] Remaining ticket check (loop back if needed, respecting MAX_LOOP_ITERATIONS)
     [ ] Retrospective generated with recovery metadata
     [ ] sprint-state.json updated to phase="complete"

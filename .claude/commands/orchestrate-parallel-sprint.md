@@ -983,26 +983,89 @@ else
 fi
 ```
 
-### Step 0F.8: Verify E2E Tool Availability
+### Step 0F.8: Verify E2E Tool Availability (HARD GATE when e2e: true)
 
-If E2E_CMD is configured, verify the tool is installed before reaching Phase 6:
+If E2E is enabled in config (`phases.e2e: true`), agent-browser MUST be available.
+Do NOT silently skip — the user explicitly opted into E2E verification.
 
 ```bash
 if [ -n "${E2E_CMD}" ] && [ "${E2E_CMD}" != "none" ]; then
+
+  # Try 1: Global install
   if command -v agent-browser >/dev/null 2>&1; then
     echo "✅ agent-browser CLI found: $(agent-browser --version 2>/dev/null || echo 'installed')"
     E2E_AVAILABLE=true
+    E2E_PREFIX="agent-browser"
+
+  # Try 2: npx fallback (zero-install)
+  elif npx agent-browser --version >/dev/null 2>&1; then
+    echo "✅ agent-browser available via npx: $(npx agent-browser --version 2>/dev/null)"
+    E2E_AVAILABLE=true
+    E2E_PREFIX="npx agent-browser"
+
+  # Neither works — STOP and ask the user
   else
-    echo "⚠️  agent-browser CLI not found in PATH."
-    echo "   Phase 6 (E2E behavioral verification) will be SKIPPED."
-    echo "   To install: npm install -g agent-browser"
-    echo "   The sprint will still run — E2E is non-blocking."
-    E2E_AVAILABLE=false
+    echo ""
+    echo "═══════════════════════════════════════════════════════════════"
+    echo "  E2E VERIFICATION REQUIRED BUT agent-browser NOT FOUND"
+    echo "═══════════════════════════════════════════════════════════════"
+    echo ""
+    echo "  Your config has e2e: true, but agent-browser is not installed."
+    echo ""
+    echo "  Options:"
+    echo "    [1] Install now — npm install -g agent-browser && agent-browser install"
+    echo "        I'll wait and retry after you install."
+    echo ""
+    echo "    [2] Skip E2E for this sprint only"
+    echo "        Config stays unchanged. Next sprint will ask again."
+    echo ""
+    echo "    [3] Abort sprint"
+    echo "        Fix the issue and re-run /sprint."
+    echo ""
+    echo "═══════════════════════════════════════════════════════════════"
+    echo ""
+
+    # WAIT for user choice
+    USER_CHOICE = prompt user for [1/2/3]
+
+    if USER_CHOICE == "1":
+        echo "Waiting for you to install agent-browser..."
+        echo "Run: npm install -g agent-browser && agent-browser install"
+        WAIT for user to confirm installation is complete
+
+        # Retry detection
+        if command -v agent-browser >/dev/null 2>&1; then
+            echo "✅ agent-browser CLI found after install"
+            E2E_AVAILABLE=true
+            E2E_PREFIX="agent-browser"
+        elif npx agent-browser --version >/dev/null 2>&1; then
+            echo "✅ agent-browser available via npx after install"
+            E2E_AVAILABLE=true
+            E2E_PREFIX="npx agent-browser"
+        else
+            echo "❌ agent-browser still not found. Aborting sprint."
+            HARD STOP
+        fi
+
+    elif USER_CHOICE == "2":
+        echo "⚠️  E2E skipped for this sprint only. Config unchanged."
+        E2E_AVAILABLE=false
+        E2E_PREFIX=""
+
+    elif USER_CHOICE == "3":
+        echo "Sprint aborted."
+        HARD STOP
+    fi
   fi
 else
+  # E2E not configured — nothing to check
   E2E_AVAILABLE=false
+  E2E_PREFIX=""
 fi
 ```
+
+If `E2E_AVAILABLE=true`, store `E2E_PREFIX` in sprint-state.json so Phase 6 and
+recovery (`/sprint-resume`) know whether to use `agent-browser` or `npx agent-browser`.
 
 ---
 
@@ -3590,8 +3653,8 @@ At any point during Phase 4-5:
 
 ```
 if E2E_AVAILABLE == false:
-    LOG: "⏭️  PHASE 6 SKIPPED — agent-browser not installed (detected in Step 0F.8)"
-    LOG: "   Sprint continues without E2E behavioral verification."
+    LOG: "⏭️  PHASE 6 SKIPPED — user chose to skip E2E in Step 0F.8"
+    LOG: "   (E2E was either not configured or explicitly skipped for this sprint)"
     → Skip to Phase 7
 ```
 
@@ -3654,6 +3717,15 @@ model: "sonnet"
 ```
 You are the E2E TEST AGENT for ticket {TICKET_ID}: "{TICKET_TITLE}".
 
+## FIRST: Load the agent-browser skill
+Before any browser interaction, load the agent-browser skill for canonical
+usage patterns, timeout handling, and session management:
+
+Use the Skill tool to invoke: agent-browser
+
+This gives you the full snapshot-ref workflow, error recovery patterns,
+and best practices from Vercel's official skill definition.
+
 ## THE BEHAVIORAL VERIFICATION RULE
 Running tests is necessary but NOT sufficient.
 You must verify the feature BEHAVES correctly in a running application.
@@ -3662,17 +3734,17 @@ You must verify the feature BEHAVES correctly in a running application.
 {TICKET_DESCRIPTION}
 
 ## Tool: agent-browser (Vercel)
-You use `agent-browser` CLI for all browser interactions. It returns lightweight
+You use `{E2E_PREFIX}` for all browser interactions. It returns lightweight
 @ref snapshots instead of full DOM trees, keeping context usage minimal.
 
 ### Core Workflow: Navigate → Snapshot → Interact → Re-snapshot
 ```bash
 # Always chain commands with && when intermediate output isn't needed
-agent-browser open http://localhost:3000/{path} && agent-browser snapshot -i
+{E2E_PREFIX} open http://localhost:3000/{path} && {E2E_PREFIX} snapshot -i
 # snapshot -i returns interactive elements as @e1, @e2, etc.
 # Use these refs for ALL subsequent interactions:
-agent-browser click @e3 && agent-browser snapshot -i
-agent-browser fill @e5 "test input" && agent-browser snapshot -i
+{E2E_PREFIX} click @e3 && {E2E_PREFIX} snapshot -i
+{E2E_PREFIX} fill @e5 "test input" && {E2E_PREFIX} snapshot -i
 ```
 
 ### Key Commands
@@ -3691,9 +3763,9 @@ agent-browser fill @e5 "test input" && agent-browser snapshot -i
 Use `--session {TICKET_ID}` on EVERY command to prevent interference with other
 E2E agents running in parallel:
 ```bash
-agent-browser --session {TICKET_ID} open http://localhost:3000/{path}
-agent-browser --session {TICKET_ID} snapshot -i
-agent-browser --session {TICKET_ID} click @e3
+{E2E_PREFIX} --session {TICKET_ID} open http://localhost:3000/{path}
+{E2E_PREFIX} --session {TICKET_ID} snapshot -i
+{E2E_PREFIX} --session {TICKET_ID} click @e3
 ```
 
 ### Ref Lifecycle Warning
@@ -3716,7 +3788,7 @@ Capture: test output, pass/fail counts, any error messages.
 If no E2E test runner is configured, skip to Step 3.
 
 ## Step 3: Browser-Based Behavioral Verification (agent-browser)
-This is the PRIMARY verification method. Use agent-browser to interact with
+This is the PRIMARY verification method. Use {E2E_PREFIX} to interact with
 the running application and verify the feature works end-to-end.
 
 {IF PROBLEM_STATEMENT_LOADED:
@@ -3724,13 +3796,13 @@ the running application and verify the feature works end-to-end.
   The user defined these as their expected experience when the feature is complete.
   Test EACH step as a browser interaction:
   {PASTE user journey steps from ${PROBLEM_DIR}/problem-statement.md}
-  Each step = one agent-browser interaction sequence with evidence capture.
+  Each step = one {E2E_PREFIX} interaction sequence with evidence capture.
 }
 
   a. NAVIGATE to the feature:
      ```bash
-     agent-browser --session {TICKET_ID} open http://localhost:3000/{feature-path}
-     agent-browser --session {TICKET_ID} snapshot -i
+     {E2E_PREFIX} --session {TICKET_ID} open http://localhost:3000/{feature-path}
+     {E2E_PREFIX} --session {TICKET_ID} snapshot -i
      ```
 
   b. INTERACT with the feature (happy path):
@@ -3738,18 +3810,18 @@ the running application and verify the feature works end-to-end.
      - Capture snapshots at each step as evidence
      - Verify page content changes as expected:
        ```bash
-       agent-browser --session {TICKET_ID} get text @e7  # Check result text
-       agent-browser --session {TICKET_ID} get url        # Verify redirect
-       agent-browser --session {TICKET_ID} screenshot evidence-{TICKET_ID}-happy.png
+       {E2E_PREFIX} --session {TICKET_ID} get text @e7  # Check result text
+       {E2E_PREFIX} --session {TICKET_ID} get url        # Verify redirect
+       {E2E_PREFIX} --session {TICKET_ID} screenshot evidence-{TICKET_ID}-happy.png
        ```
 
   c. TEST ERROR CASES via browser:
      - Submit empty forms, invalid data
      - Verify error messages appear:
        ```bash
-       agent-browser --session {TICKET_ID} fill @e3 ""
-       agent-browser --session {TICKET_ID} click @e5  # Submit
-       agent-browser --session {TICKET_ID} snapshot -i  # Check for error message
+       {E2E_PREFIX} --session {TICKET_ID} fill @e3 ""
+       {E2E_PREFIX} --session {TICKET_ID} click @e5  # Submit
+       {E2E_PREFIX} --session {TICKET_ID} snapshot -i  # Check for error message
        ```
 
   d. HIT API ENDPOINTS directly (if this is an API feature):
@@ -3768,7 +3840,7 @@ the running application and verify the feature works end-to-end.
 
   g. CHECK LOGS: Verify no unexpected errors or warnings in server logs:
      ```bash
-     agent-browser --session {TICKET_ID} eval "window.__SERVER_ERRORS || []"
+     {E2E_PREFIX} --session {TICKET_ID} eval "window.__SERVER_ERRORS || []"
      ```
 
 ## Step 4: Collect Evidence
@@ -3801,7 +3873,7 @@ If ANY test fails OR behavioral check fails:
    - Expected behavior
    - Actual behavior (with evidence — screenshots, @ref text, curl responses)
    - File paths involved
-   - Steps to reproduce (agent-browser commands that trigger the failure)
+   - Steps to reproduce ({E2E_PREFIX} commands that trigger the failure)
    - Suggested fix approach
 3. Add a learning to progress.txt:
    "E2E: {what broke and why}"
@@ -3818,7 +3890,7 @@ Output: E2E_PASS for ticket {TICKET_ID} — with evidence summary.
 
 ## Cleanup
 ```bash
-agent-browser --session {TICKET_ID} close  # Release browser session
+{E2E_PREFIX} --session {TICKET_ID} close  # Release browser session
 # Do NOT kill the dev server — the orchestrator handles that after ALL E2E agents complete.
 ```
 ```
@@ -4473,7 +4545,7 @@ echo "Cleanup complete."
     [ ] Problem statement loaded (if ${PROBLEM_DIR}/problem-statement.md exists from /define)
     [ ] User journey steps extracted for Phase 6 E2E scenarios
     [ ] Success criteria extracted for Layer 4 Completion Agent
-    [ ] E2E tool availability checked (agent-browser installed → E2E_AVAILABLE=true/false)
+    [ ] E2E tool availability checked (hard gate: agent-browser or npx fallback, user prompted if missing)
     [ ] Coordination mode chosen (Subagents or Agent Teams)
     [ ] Agent Teams env flag verified (if Agent Teams mode)
     [ ] sprint-state.json initialized with all ticket entries

@@ -357,12 +357,34 @@ node -e "const p=require('./package.json'); console.log('test:run:', p.scripts?.
 
 If sprint-config.yml exists, cross-reference its commands against package.json scripts.
 
-### Step 4C: E2E Availability
+### Step 4C: E2E Availability (severity depends on config)
 
 ```bash
-command -v agent-browser >/dev/null 2>&1 && echo "agent-browser: OK" || echo "agent-browser: NOT INSTALLED (Phase 6 will be skipped)"
+# Check agent-browser availability (global install or npx)
+if command -v agent-browser >/dev/null 2>&1; then
+  echo "agent-browser: OK (global install)"
+elif npx agent-browser --version >/dev/null 2>&1; then
+  echo "agent-browser: OK (available via npx)"
+else
+  echo "agent-browser: NOT INSTALLED"
+fi
+
+# Check existing test runner if configured
 command -v npx >/dev/null 2>&1 && npx playwright --version 2>/dev/null && echo "playwright: OK" || echo "playwright: NOT INSTALLED"
 ```
+
+**Severity depends on config:**
+- If `phases.e2e: true` in sprint-config.yml AND agent-browser not found → **CRITICAL**:
+  ```
+  CRITICAL: E2E is enabled (phases.e2e: true) but agent-browser is not installed.
+    /sprint will block at Step 0F.8 and prompt for installation.
+    Fix: npm install -g agent-browser && agent-browser install
+    Or: set phases.e2e: false in .claude/sprint-config.yml
+  ```
+- If `phases.e2e: false` or not configured AND agent-browser not found → **INFO**:
+  ```
+  INFO: agent-browser not installed. E2E is disabled in config — no impact.
+  ```
 
 ### Step 4D: Worktree Readiness
 
@@ -673,7 +695,7 @@ NOTHING. This command is read-only. Output is displayed to the user only.
     [ ] Git state checked (clean/dirty, current branch)
     [ ] .claude/worktrees/ gitignore verified
     [ ] Build commands existence checked (NOT executed)
-    [ ] E2E tool availability checked
+    [ ] E2E tool availability checked (CRITICAL if e2e: true and agent-browser missing)
     [ ] Stale worktrees detected
     [ ] sprint-state.json status checked
     [ ] Failure patterns loaded and matched (if available)
