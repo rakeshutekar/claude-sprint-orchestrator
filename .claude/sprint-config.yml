@@ -1,0 +1,56 @@
+# Sprint Configuration
+# This file is read by sprint-wave.sh (headless) and /sprint (interactive).
+# Copy this template and fill in your project-specific values.
+
+branch_base: develop
+linear_filter:
+  team: "CLA"
+  label: "sprint-current"
+  status: ["Todo", "In Progress"]
+
+# Commands — adjust to your project's toolchain
+build_cmd: "npm run build"
+lint_cmd: "npm run lint"
+test_cmd: "npm run test:run"
+typecheck_cmd: "npx tsc --noEmit"
+e2e_cmd: "npx playwright test"
+
+# Standards
+project_standards: "CLAUDE.md"
+commit_prefix: "feat"
+
+# Safety
+max_loop_iterations: 3
+max_parallel: 0              # 0 = unlimited — all agents run concurrently
+
+# Model policy
+models:
+  context: "sonnet"          # Codebase research
+  worker: "opus"             # Implementation
+  verification: "sonnet"     # Independent verification
+  review: "sonnet"           # Code review
+  fix: "opus"                # Bug fixes
+  completion: "sonnet"       # Requirement matching
+  scheduler: "sonnet"        # Merge ordering
+  conflict: "opus"           # Merge conflict resolution
+  e2e: "sonnet"              # E2E behavioral verification
+  # NO HAIKU. EVER.
+
+# Phase toggles — set false to skip a phase
+phases:
+  verification: true         # Phase 3: 4-layer verification
+  code_review: true          # Phase 3: Code review agent
+  e2e: true                  # Phase 6: E2E behavioral verification
+  remaining_check: true      # Phase 7: Loop for remaining tickets
+
+# Per-problem overrides (optional)
+# If a problem has its own linear_filter or branch_base, specify here.
+# Unspecified fields inherit from the global config above.
+# problems:
+#   auth-system:
+#     linear_filter:
+#       label: "sprint-auth"
+#     branch_base: "feature/auth"
+#   notifications:
+#     linear_filter:
+#       label: "sprint-notifications"

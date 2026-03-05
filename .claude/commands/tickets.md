@@ -129,6 +129,36 @@ If the user doesn't provide config, use the defaults above and ask only for FEAT
 
 ---
 
+## STEP 0-PRE: RESOLVE PROBLEM DIRECTORY
+
+Before any other work, determine which problem directory to use:
+
+```
+RESOLVE PROBLEM DIRECTORY:
+  Step 1: If user provided a problem ID as argument → PROBLEM_ID = that argument
+  Step 2: Else if .claude/active-problem exists → PROBLEM_ID = contents of that file
+  Step 3: Else if exactly one directory under .claude/sprints/ → PROBLEM_ID = its name
+  Step 4: Else if legacy singleton files exist (.claude/problem-statement.md, .claude/sprint-hints.json) →
+          PROBLEM_ID = "default"
+          mkdir -p .claude/sprints/default
+          mv .claude/problem-statement.md .claude/sprints/default/ 2>/dev/null
+          mv .claude/sprint-hints.json .claude/sprints/default/ 2>/dev/null
+          mv .claude/sprint-state.json .claude/sprints/default/ 2>/dev/null
+          mv .claude/sprint-dashboard.md .claude/sprints/default/ 2>/dev/null
+          mv .claude/sprint-preflight.json .claude/sprints/default/ 2>/dev/null
+          echo "default" > .claude/active-problem
+          echo "Migrated legacy sprint files to .claude/sprints/default/"
+  Step 5: Else → HARD STOP:
+          "No active problem found. Run /define first to create a problem statement,
+           or pass a problem ID: /tickets <problem-id> <feature description>"
+
+  PROBLEM_DIR = .claude/sprints/${PROBLEM_ID}
+```
+
+Display: `Active problem: ${PROBLEM_ID} (${PROBLEM_DIR}/)`
+
+---
+
 ## PHASE 0: PRE-FLIGHT
 
 ### Step 0-Pre: Load Problem Statement (from /define)
@@ -136,9 +166,9 @@ If the user doesn't provide config, use the defaults above and ask only for FEAT
 Check if `/define` was run before this command. Validate schema, required sections, and freshness.
 
 ```bash
-if [ -f .claude/problem-statement.md ]; then
+if [ -f ${PROBLEM_DIR}/problem-statement.md ]; then
   echo "📋 Found problem statement from /define. Loading..."
-  PROBLEM_STATEMENT = read .claude/problem-statement.md
+  PROBLEM_STATEMENT = read ${PROBLEM_DIR}/problem-statement.md
 
   # ─── SCHEMA VALIDATION ───
   # Required header fields (added in schema_version 2):
@@ -162,7 +192,7 @@ if [ -f .claude/problem-statement.md ]; then
   missing_sections = []
 
   for section in REQUIRED_SECTIONS:
-      if ! grep -qi "^## ${section}" .claude/problem-statement.md; then
+      if ! grep -qi "^## ${section}" ${PROBLEM_DIR}/problem-statement.md; then
           missing_sections.append(section)
       fi
   done
@@ -179,7 +209,7 @@ if [ -f .claude/problem-statement.md ]; then
   missing_subsections = []
 
   for subsection in EXPECTED_SUBSECTIONS:
-      if ! grep -qi "^### ${subsection}" .claude/problem-statement.md; then
+      if ! grep -qi "^### ${subsection}" ${PROBLEM_DIR}/problem-statement.md; then
           missing_subsections.append(subsection)
       fi
   done
@@ -250,7 +280,7 @@ To extract sections from the markdown problem statement, use this heading-based 
 
 extract_section() {
     local heading="$1"
-    local file="${2:-.claude/problem-statement.md}"  # Accepts optional file path argument
+    local file="${2:-${PROBLEM_DIR}/problem-statement.md}"  # Accepts optional file path argument
 
     # ROBUSTNESS: This parser handles:
     #   1. Code fences — headings inside ``` blocks are ignored (not treated as section boundaries)
@@ -321,7 +351,7 @@ extract_section() {
 #     CONSTRAINTS=""
 # fi
 #
-# Custom file path (default is .claude/problem-statement.md):
+# Custom file path (default is ${PROBLEM_DIR}/problem-statement.md):
 # SECTION=$(extract_section "Overview" ".claude/plans/my-plan.md")
 ```
 
@@ -367,11 +397,13 @@ mkdir -p .claude/agent-memory/tickets-explore
 # Ensure .claude/worktrees/ is in .gitignore (for /sprint later)
 git check-ignore -q .claude/worktrees/ 2>/dev/null || echo ".claude/worktrees/" >> .gitignore
 
-# Ensure sprint dashboard and state files are gitignored
-git check-ignore -q .claude/sprint-dashboard.md 2>/dev/null || echo ".claude/sprint-dashboard.md" >> .gitignore
-git check-ignore -q .claude/sprint-state.json 2>/dev/null || echo ".claude/sprint-state.json" >> .gitignore
-git check-ignore -q .claude/problem-statement.md 2>/dev/null || echo ".claude/problem-statement.md" >> .gitignore
-git check-ignore -q .claude/sprint-hints.json 2>/dev/null || echo ".claude/sprint-hints.json" >> .gitignore
+# Ensure sprint directories are gitignored
+if ! grep -q ".claude/sprints/" .gitignore 2>/dev/null; then
+  echo ".claude/sprints/" >> .gitignore
+fi
+if ! grep -q ".claude/active-problem" .gitignore 2>/dev/null; then
+  echo ".claude/active-problem" >> .gitignore
+fi
 ```
 
 ---
@@ -401,7 +433,7 @@ section. These are patterns discovered by prior sprint agents that may inform yo
 If progress.txt does NOT exist (first sprint on this repo), skip this step — do not error.
 
 ## Persistent Memory (from previous /tickets runs)
-Check .claude/agent-memory/tickets-explore/ for previous analysis of this codebase.
+Check ${PROBLEM_DIR}/agent-memory/tickets-explore/ for previous analysis of this codebase.
 If the directory doesn't exist or is empty, skip (first run on this repo).
 If previous analysis exists:
   - Read it and use relevant findings to ACCELERATE your analysis
@@ -409,7 +441,7 @@ If previous analysis exists:
   - Stale entries (referencing files that no longer exist) should be noted for pruning
 
 After completing your analysis, UPDATE your agent memory:
-  - Save to .claude/agent-memory/tickets-explore/
+  - Save to ${PROBLEM_DIR}/agent-memory/tickets-explore/
   - Include: architecture patterns, test infrastructure, error handling conventions,
     integration points, and any corrections to previous entries
 
@@ -1408,8 +1440,9 @@ Display recommendation in the Sprint Config output:
 Save ticket metadata that `/sprint` can use to pre-populate sprint-state.json:
 
 ```bash
-cat > .claude/sprint-hints.json << 'HINTSEOF'
+cat > ${PROBLEM_DIR}/sprint-hints.json << 'HINTSEOF'
 {
+  "problem_id": "${PROBLEM_ID}",
   "generated_at": "{ISO_TIMESTAMP}",
   "plan_commit": "{BRANCH_BASE_COMMIT_HASH}",
   "tickets": {
@@ -1452,7 +1485,7 @@ multiple `/tickets` runs, it accumulates knowledge about the codebase:
 
 ```
 Memory scope: project
-Location: .claude/agent-memory/tickets-explore/
+Location: ${PROBLEM_DIR}/agent-memory/tickets-explore/
 
 What gets saved:
   - Architecture patterns discovered (file structure, naming conventions)
@@ -1475,7 +1508,7 @@ Before starting:
 1. Check if progress.txt exists at repo root. If it does, read the Codebase Patterns
    section FIRST — these are learnings from previous sprints.
    If it doesn't exist, skip (Phase 0D creates it, but may not have run yet).
-2. Check .claude/agent-memory/tickets-explore/ for previous analysis of this codebase.
+2. Check ${PROBLEM_DIR}/agent-memory/tickets-explore/ for previous analysis of this codebase.
    If directory doesn't exist or is empty, skip (first run).
    Use any relevant findings to accelerate your analysis, but VERIFY they are still
    current (files may have moved or changed since last analysis).
@@ -1486,7 +1519,7 @@ After completing: Update your agent memory with:
 - Error handling conventions
 - Integration points mapped
 - Any corrections to previous memory entries
-Save to: .claude/agent-memory/tickets-explore/ (directory created by Phase 0D)
+Save to: ${PROBLEM_DIR}/agent-memory/tickets-explore/ (directory created by Phase 0D)
 ```
 
 ---
@@ -1573,7 +1606,7 @@ Or tell me: "delete the tickets you just created"
     generated against a broken codebase have unreliable file context.
 16. **Tag the codebase snapshot.** Phase 5A.5 tags the exact commit the plan was
     generated against. /sprint uses this to detect stale plans.
-17. **Save sprint hints.** Phase 5C writes .claude/sprint-hints.json for /sprint
+17. **Save sprint hints.** Phase 5C writes ${PROBLEM_DIR}/sprint-hints.json for /sprint
     to pre-populate state and detect plan staleness.
 18. **Track partial creation for rollback.** Phase 4 must track created ticket IDs
     as they are created, so a mid-creation failure can be rolled back.
@@ -1727,8 +1760,9 @@ Before presenting to user at Phase 3, verify:
     [ ] extract_section() parser available for downstream steps
 [ ] Phase 0: Linear MCP connected, git clean, baseline build passes
 [ ] Phase 0: progress.txt initialized (or already exists)
-[ ] Phase 0: .claude/agent-memory/tickets-explore/ directory created
-[ ] Phase 0: .gitignore includes worktrees, sprint-dashboard, sprint-state, problem-statement, sprint-hints
+[ ] Phase 0: ${PROBLEM_DIR}/agent-memory/tickets-explore/ directory created
+[ ] Step 0-Pre: Problem directory resolved (PROBLEM_DIR set)
+[ ] Phase 0: .gitignore includes worktrees, .claude/sprints/, .claude/active-problem
 [ ] Phase 1: ARCHITECTURE_REPORT has 0 UNVERIFIED references
 [ ] Phase 1: Test infrastructure documented (runner, mocking, fixtures)
 [ ] Phase 1: Error patterns documented with examples
@@ -1750,7 +1784,7 @@ Before presenting to user at Phase 3, verify:
 [ ] Sprint config generated (includes COMMIT_PREFIX, HUMAN_IN_LOOP, PARTIAL_MERGE, SPRINT_DASHBOARD)
 [ ] Codebase snapshot tagged (tickets-plan-{timestamp})
 [ ] Staleness warning displayed
-[ ] Sprint hints saved (.claude/sprint-hints.json)
+[ ] Sprint hints saved (${PROBLEM_DIR}/sprint-hints.json)
 [ ] Coordination mode recommendation provided
 [ ] Partial creation rollback tracking in place for Phase 4
 [ ] Phase 3 modification re-enrichment logic ready (if user modifies tickets)

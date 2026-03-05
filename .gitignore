@@ -1,6 +1,11 @@
 .claude/worktrees/
+.claude/sprints/
+.claude/active-problem
 .claude/sprint-state.json
 .claude/sprint-dashboard.md
+.claude/sprint-hints.json
+.claude/sprint-preflight.json
+.claude/problem-statement.md
 .claude/sprint-history/
 .claude/agent-memory/
 .claude/plans/

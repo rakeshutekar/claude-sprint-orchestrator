@@ -543,7 +543,7 @@ Choose [1/2/3]:
 
 **If user chooses [1] — Compact and Continue:**
 
-Before compacting, the orchestrator MUST dump ALL parsed state to `.claude/sprint-preflight.json`.
+Before compacting, the orchestrator MUST dump ALL parsed state to `${PROBLEM_DIR}/sprint-preflight.json`.
 This file is the checkpoint that makes compaction lossless.
 
 ```bash
@@ -551,7 +551,7 @@ This file is the checkpoint that makes compaction lossless.
 #    This ensures we have all config, hints, failure patterns, etc. loaded
 
 # 2. Write sprint-preflight.json with everything parsed so far
-cat > .claude/sprint-preflight.json << 'PREFLIGHTEOF'
+cat > ${PROBLEM_DIR}/sprint-preflight.json << 'PREFLIGHTEOF'
 {
   "version": 1,
   "created_at": "{ISO-8601 timestamp}",
@@ -612,16 +612,16 @@ cat > .claude/sprint-preflight.json << 'PREFLIGHTEOF'
 PREFLIGHTEOF
 
 # 3. Ensure sprint-preflight.json is gitignored
-git check-ignore -q .claude/sprint-preflight.json 2>/dev/null || echo ".claude/sprint-preflight.json" >> .gitignore
+git check-ignore -q ${PROBLEM_DIR}/sprint-preflight.json 2>/dev/null || echo "${PROBLEM_DIR}/sprint-preflight.json" >> .gitignore
 
 # 4. Tell the user what's happening
-echo "✅ Sprint state saved to .claude/sprint-preflight.json"
+echo "✅ Sprint state saved to ${PROBLEM_DIR}/sprint-preflight.json"
 echo "   Compacting context now. Sprint will resume automatically after compaction."
 
 # 5. Trigger compaction (the orchestrator compacts itself)
 # After compaction, the orchestrator's FIRST actions are:
 #   a. Re-read orchestrate-parallel-sprint.md (reload behavioral rules)
-#   b. Check for .claude/sprint-preflight.json
+#   b. Check for ${PROBLEM_DIR}/sprint-preflight.json
 #   c. If found AND not stale (< 5 minutes old):
 #      - Load all state from the file
 #      - Skip Steps 0A through 0F.5 (already completed)
@@ -653,9 +653,9 @@ The user never sees this gate when context is healthy.
 orchestrator can skip re-parsing and jump ahead.
 
 ```bash
-if [ -f .claude/sprint-preflight.json ]; then
+if [ -f ${PROBLEM_DIR}/sprint-preflight.json ]; then
   # Validate freshness (must be < 5 minutes old)
-  created_at=$(jq -r '.created_at' .claude/sprint-preflight.json)
+  created_at=$(jq -r '.created_at' ${PROBLEM_DIR}/sprint-preflight.json)
   age_seconds=$(($(date +%s) - $(date -d "$created_at" +%s 2>/dev/null || echo 0)))
 
   if [ "$age_seconds" -lt 300 ] && [ "$age_seconds" -gt 0 ]; then
@@ -663,12 +663,12 @@ if [ -f .claude/sprint-preflight.json ]; then
     echo "   Skipping Steps 0A-0F.5 (already completed before compaction)."
 
     # Load all state from preflight file
-    CONFIG = read .claude/sprint-preflight.json → config
-    SPRINT_HINTS = read .claude/sprint-preflight.json → sprint_hints
+    CONFIG = read ${PROBLEM_DIR}/sprint-preflight.json → config
+    SPRINT_HINTS = read ${PROBLEM_DIR}/sprint-preflight.json → sprint_hints
     FAILURE_PATTERNS = read .claude/failure-patterns.json  # re-read from disk (authoritative)
-    GIT_STATE = read .claude/sprint-preflight.json → git_state
-    PRE_FLIGHT = read .claude/sprint-preflight.json → pre_flight_completed
-    USER_CHOICES = read .claude/sprint-preflight.json → user_choices
+    GIT_STATE = read ${PROBLEM_DIR}/sprint-preflight.json → git_state
+    PRE_FLIGHT = read ${PROBLEM_DIR}/sprint-preflight.json → pre_flight_completed
+    USER_CHOICES = read ${PROBLEM_DIR}/sprint-preflight.json → user_choices
 
     # Restore user choices if they were already made before compaction
     if USER_CHOICES.coordination_mode is not null:
@@ -681,11 +681,11 @@ if [ -f .claude/sprint-preflight.json ]; then
     current_head=$(git rev-parse HEAD)
     if [ "$current_head" != "{GIT_STATE.head_sha}" ]; then
       echo "⚠️ HEAD moved during compaction. Running full pre-flight."
-      rm .claude/sprint-preflight.json
+      rm ${PROBLEM_DIR}/sprint-preflight.json
       # Fall through to Step 0A
     else
       # Clean up — delete preflight file to prevent stale reuse
-      rm .claude/sprint-preflight.json
+      rm ${PROBLEM_DIR}/sprint-preflight.json
 
       # Determine resume point based on what was already completed
       if COORDINATION_MODE is set:
@@ -698,11 +698,37 @@ if [ -f .claude/sprint-preflight.json ]; then
     fi
   else
     echo "⚠️ sprint-preflight.json is stale (${age_seconds}s old). Ignoring."
-    rm .claude/sprint-preflight.json
+    rm ${PROBLEM_DIR}/sprint-preflight.json
     # Fall through to Step 0A (full pre-flight)
   fi
 fi
 ```
+
+---
+
+### Step 0-Pre.5: Resolve Problem Directory
+
+Before any pre-flight checks, determine which problem directory to use.
+The `/sprint` wrapper should have already resolved PROBLEM_ID, but if invoked directly:
+
+```
+RESOLVE PROBLEM DIRECTORY:
+  Step 1: If PROBLEM_ID was passed from /sprint wrapper → use it
+  Step 2: Else if .claude/active-problem exists → PROBLEM_ID = contents of that file
+  Step 3: Else if exactly one directory under .claude/sprints/ → use its name
+  Step 4: Else if legacy singleton files exist (.claude/problem-statement.md, .claude/sprint-hints.json, .claude/sprint-state.json) →
+          PROBLEM_ID = "default"
+          mkdir -p .claude/sprints/default
+          Move each legacy file to .claude/sprints/default/
+          echo "default" > .claude/active-problem
+          Log: "Migrated legacy sprint files to .claude/sprints/default/"
+  Step 5: Else → HARD STOP: "No active problem found. Run /define first to create a problem."
+
+  PROBLEM_DIR = .claude/sprints/${PROBLEM_ID}
+  mkdir -p ${PROBLEM_DIR}
+```
+
+**KEY INVARIANT:** Once set, `PROBLEM_ID` is written into `sprint-state.json` and `PROBLEM_DIR` is used for ALL state file reads/writes throughout the sprint lifecycle. The orchestrator NEVER re-reads `.claude/active-problem` after this point. This makes concurrent sprints safe.
 
 ---
 
@@ -746,17 +772,18 @@ if [ $? -ne 0 ]; then
   echo ".claude/worktrees/" >> .gitignore
 fi
 
-# 2. Ensure sprint runtime files are gitignored (they're live files, not code)
-git check-ignore -q .claude/sprint-dashboard.md 2>/dev/null || echo ".claude/sprint-dashboard.md" >> .gitignore
-git check-ignore -q .claude/sprint-state.json 2>/dev/null || echo ".claude/sprint-state.json" >> .gitignore
-git check-ignore -q .claude/sprint-hints.json 2>/dev/null || echo ".claude/sprint-hints.json" >> .gitignore
-git check-ignore -q .claude/sprint-preflight.json 2>/dev/null || echo ".claude/sprint-preflight.json" >> .gitignore
-git check-ignore -q .claude/problem-statement.md 2>/dev/null || echo ".claude/problem-statement.md" >> .gitignore
+# 2. Ensure sprint runtime directories are gitignored (multi-problem support)
+if ! grep -q ".claude/sprints/" .gitignore 2>/dev/null; then
+  echo ".claude/sprints/" >> .gitignore
+fi
+if ! grep -q ".claude/active-problem" .gitignore 2>/dev/null; then
+  echo ".claude/active-problem" >> .gitignore
+fi
 
 # 3. Commit gitignore changes if any
 if ! git diff --quiet .gitignore 2>/dev/null; then
   git add .gitignore
-  git commit -m "chore: gitignore sprint runtime files and worktrees"
+  git commit -m "chore: gitignore sprint problem directories and worktrees"
 fi
 
 # 4. Clean up any stale worktrees from previous sprints
@@ -769,71 +796,91 @@ done
 mkdir -p .claude/worktrees
 ```
 
-### Step 0F: Initialize progress.txt (RALPH PATTERN)
+### Step 0F: Initialize progress.txt — Two-Tier (RALPH PATTERN)
+
+Progress is split into two files:
+- **Global `progress.txt`** (repo root): Codebase Patterns only — shared across all problems
+- **Per-problem `${PROBLEM_DIR}/progress.txt`**: Completed Tickets + sprint-specific learnings
+
 ```bash
-# Create or verify progress.txt exists
+# 1. Global progress.txt — codebase patterns (shared across all sprints)
 if [ ! -f progress.txt ]; then
   cat > progress.txt << 'EOF'
-# Sprint Progress
-
-## Codebase Patterns (read FIRST before starting any task)
+# Codebase Patterns (read FIRST before starting any task)
 - (none yet — agents will add patterns as they discover them)
+EOF
+  git add progress.txt
+  git commit -m "chore: initialize global progress.txt for codebase patterns"
+else
+  # Global progress.txt already exists — check if it needs migration.
+  # Old format had "## Completed Tickets" section; move those to per-problem file.
+  if grep -q "^## Completed Tickets" progress.txt 2>/dev/null; then
+    LOG: "Migrating Completed Tickets from global progress.txt to per-problem file."
+    # Extract completed tickets section
+    COMPLETED=$(sed -n '/^## Completed Tickets/,$p' progress.txt)
+    # Keep only Codebase Patterns in global
+    PATTERNS=$(sed -n '1,/^## Completed Tickets/p' progress.txt | head -n -1)
+    echo "$PATTERNS" > progress.txt
+    # Move completed tickets to per-problem file
+    echo "$COMPLETED" >> ${PROBLEM_DIR}/progress.txt
+    git add progress.txt
+    git commit -m "chore: migrate completed tickets from global to per-problem progress.txt"
+  fi
+
+  # Prune global progress.txt if too large (>200 lines of patterns)
+  PATTERN_LINES=$(wc -l < progress.txt)
+  if [ "$PATTERN_LINES" -gt 200 ]; then
+    LOG: "Global progress.txt has ${PATTERN_LINES} lines — consider consolidating patterns."
+  fi
+fi
+
+# 2. Per-problem progress.txt — sprint learnings + completed tickets
+mkdir -p ${PROBLEM_DIR}
+if [ ! -f ${PROBLEM_DIR}/progress.txt ]; then
+  cat > ${PROBLEM_DIR}/progress.txt << 'EOF'
+# Sprint Progress: ${PROBLEM_ID}
+
+## Sprint Learnings
+- (none yet — agents will add learnings specific to this problem)
 
 ## Completed Tickets
 (none yet)
 EOF
-  git add progress.txt
-  git commit -m "chore: initialize sprint progress.txt"
+  LOG: "Initialized per-problem progress.txt at ${PROBLEM_DIR}/progress.txt"
 else
-  # progress.txt already exists — check if it needs pruning.
-  # After 20+ sprints, the "Completed Tickets" section can grow to thousands of lines.
-  # Workers read progress.txt FIRST, so bloat wastes their context window.
-  COMPLETED_LINES=$(sed -n '/^## Completed Tickets/,/^## /p' progress.txt | wc -l)
+  # Per-problem progress.txt exists — check if Completed Tickets section needs pruning
+  COMPLETED_LINES=$(sed -n '/^## Completed Tickets/,/^## /p' ${PROBLEM_DIR}/progress.txt | wc -l)
   if [ "$COMPLETED_LINES" -gt 200 ]; then
-    LOG: "progress.txt Completed Tickets section has ${COMPLETED_LINES} lines — pruning."
-
-    # PRUNING STRATEGY:
-    # 1. Keep the "Codebase Patterns" section intact (this is the high-value knowledge)
-    # 2. Keep only the last 2 sprints' entries in "Completed Tickets"
-    # 3. Rotate older entries to .claude/sprint-history/progress-archive.md
-
-    # Extract the Codebase Patterns section (always preserved)
-    PATTERNS=$(sed -n '/^## Codebase Patterns/,/^## /p' progress.txt | head -n -1)
-
-    # Extract Completed Tickets section
-    COMPLETED=$(sed -n '/^## Completed Tickets/,$p' progress.txt)
-
-    # Find the last 2 sprint boundaries (sprint entries start with "### Sprint sprint-YYYYMMDD")
-    # Keep entries from the 2 most recent sprints
+    LOG: "Per-problem progress.txt has ${COMPLETED_LINES} completed ticket lines — pruning."
+    # Archive old entries to sprint-history
+    mkdir -p .claude/sprint-history
+    COMPLETED=$(sed -n '/^## Completed Tickets/,$p' ${PROBLEM_DIR}/progress.txt)
     RECENT_SPRINTS=$(echo "$COMPLETED" | grep -n "^### Sprint" | tail -2 | head -1 | cut -d: -f1)
     if [ -n "$RECENT_SPRINTS" ]; then
       OLD_ENTRIES=$(echo "$COMPLETED" | head -n $((RECENT_SPRINTS - 1)) | tail -n +2)
-      RECENT_ENTRIES=$(echo "$COMPLETED" | tail -n +$RECENT_SPRINTS)
-
-      # Archive old entries
-      mkdir -p .claude/sprint-history
-      echo "# Progress Archive (rotated from progress.txt)" >> .claude/sprint-history/progress-archive.md
+      echo "# Progress Archive: ${PROBLEM_ID}" >> .claude/sprint-history/progress-archive.md
       echo "# Archived at: $(date -u +%Y-%m-%dT%H:%M:%SZ)" >> .claude/sprint-history/progress-archive.md
-      echo "" >> .claude/sprint-history/progress-archive.md
       echo "$OLD_ENTRIES" >> .claude/sprint-history/progress-archive.md
+      # Rebuild with only recent entries
+      LEARNINGS=$(sed -n '/^## Sprint Learnings/,/^## Completed Tickets/p' ${PROBLEM_DIR}/progress.txt | head -n -1)
+      RECENT_ENTRIES=$(echo "$COMPLETED" | tail -n +$RECENT_SPRINTS)
+      cat > ${PROBLEM_DIR}/progress.txt << PRUNEEOF
+# Sprint Progress: ${PROBLEM_ID}
 
-      # Rebuild progress.txt with only recent entries
-      cat > progress.txt << PRUNEEOF
-# Sprint Progress
-
-${PATTERNS}
+${LEARNINGS}
 
 ## Completed Tickets
 ${RECENT_ENTRIES}
 PRUNEEOF
-
-      git add progress.txt .claude/sprint-history/progress-archive.md
-      git commit -m "chore: prune progress.txt (rotated old entries to sprint-history)"
-      LOG: "Pruned ${COMPLETED_LINES} → $(wc -l < progress.txt) lines. Old entries archived."
+      LOG: "Pruned to $(wc -l < ${PROBLEM_DIR}/progress.txt) lines. Old entries archived."
     fi
   fi
 fi
 ```
+
+**Agent prompt injection:** Every agent receives BOTH progress files:
+1. Global `progress.txt` Codebase Patterns section (shared knowledge)
+2. Per-problem `${PROBLEM_DIR}/progress.txt` Sprint Learnings + Completed Tickets (problem-specific)
 
 ### Step 0F.5: Load Failure Pattern Database
 
@@ -895,9 +942,9 @@ Check if `/define` was run before `/sprint`. Validate schema and check staleness
 (same pattern as /tickets Step 0-Pre).
 
 ```bash
-if [ -f .claude/problem-statement.md ]; then
+if [ -f ${PROBLEM_DIR}/problem-statement.md ]; then
   echo "📋 Found problem statement from /define. Loading..."
-  PROBLEM_STATEMENT = read .claude/problem-statement.md
+  PROBLEM_STATEMENT = read ${PROBLEM_DIR}/problem-statement.md
 
   # ─── SCHEMA VALIDATION (lightweight — sprint only needs key sections) ───
   schema_version = extract "schema_version:" from header line
@@ -1069,19 +1116,19 @@ If `/tickets` was run before this sprint, it may have left hints:
 #   "total_edge_cases": 12
 # }
 
-if [ -f .claude/sprint-hints.json ]; then
+if [ -f ${PROBLEM_DIR}/sprint-hints.json ]; then
     echo "Sprint hints found from /tickets"
 
     # Validate ALL expected fields exist before reading
     # Required fields: plan_commit, tickets (object), total_tickets, coordination_mode_recommendation
-    if ! jq -e '.plan_commit and .tickets and .total_tickets and .coordination_mode_recommendation' .claude/sprint-hints.json >/dev/null 2>&1; then
+    if ! jq -e '.plan_commit and .tickets and .total_tickets and .coordination_mode_recommendation' ${PROBLEM_DIR}/sprint-hints.json >/dev/null 2>&1; then
         echo "⚠️  sprint-hints.json is malformed (missing required fields). Ignoring."
         echo "    Required: plan_commit, tickets, total_tickets, coordination_mode_recommendation"
-        echo "    Found: $(jq -r 'keys | join(", ")' .claude/sprint-hints.json 2>/dev/null || echo 'unparseable')"
+        echo "    Found: $(jq -r 'keys | join(", ")' ${PROBLEM_DIR}/sprint-hints.json 2>/dev/null || echo 'unparseable')"
         SPRINT_HINTS_LOADED=false
     else
         # 1. Check for stale plan
-        plan_commit=$(jq -r '.plan_commit' .claude/sprint-hints.json)
+        plan_commit=$(jq -r '.plan_commit' ${PROBLEM_DIR}/sprint-hints.json)
         current_commit=$(git rev-parse {BRANCH_BASE})
         if [ "$plan_commit" != "$current_commit" ]; then
             echo "⚠️  STALE PLAN: /tickets ran at $plan_commit, base is now $current_commit"
@@ -1089,11 +1136,11 @@ if [ -f .claude/sprint-hints.json ]; then
         fi
 
         # 2. Use recommended coordination mode as default (user still confirms at Step 0G)
-        recommended_mode=$(jq -r '.coordination_mode_recommendation' .claude/sprint-hints.json)
+        recommended_mode=$(jq -r '.coordination_mode_recommendation' ${PROBLEM_DIR}/sprint-hints.json)
         echo "Recommended coordination mode from /tickets: $recommended_mode"
 
         # 3. Pre-load ticket metadata for sprint-state initialization (Step 0H)
-        total_tickets=$(jq -r '.total_tickets' .claude/sprint-hints.json)
+        total_tickets=$(jq -r '.total_tickets' ${PROBLEM_DIR}/sprint-hints.json)
         echo "Hints loaded: $total_tickets tickets planned"
         SPRINT_HINTS_LOADED=true
     fi
@@ -1106,9 +1153,10 @@ Create `sprint-state.json` for checkpoint recovery. This file survives context
 compaction and allows the sprint to resume from the last known good state.
 
 ```bash
-cat > .claude/sprint-state.json << 'STATEEOF'
+cat > ${PROBLEM_DIR}/sprint-state.json << 'STATEEOF'
 {
   "sprint_id": "sprint-{YYYYMMDD-HHMMSS}",
+  "problem_id": "{PROBLEM_ID}",
   "coordination_mode": "{COORDINATION_MODE}",
   "branch_base": "{BRANCH_BASE}",
   "safety_tag": "sprint-start-{YYYYMMDD-HHMMSS}",
@@ -1689,11 +1737,13 @@ This is NOT a failure — it's an honest signal that helps the Worker avoid hall
 A wrong signature from you causes a build failure that burns a loop iteration.
 An honest warning costs nothing.
 
-## Accumulated Learnings (from progress.txt)
-Before starting your research, read progress.txt at the repo root (if it exists).
-Absorb the "Codebase Patterns" section — these are patterns discovered by prior agents.
-If progress.txt does not exist, skip this step (it may be the first sprint on this repo).
-{PASTE THE CURRENT CONTENTS OF progress.txt Codebase Patterns section, or "No progress.txt yet"}
+## Accumulated Learnings (from progress files)
+Before starting your research, read BOTH progress files:
+1. **Global `progress.txt`** (repo root) — Codebase Patterns discovered by prior agents across all sprints
+2. **Per-problem `${PROBLEM_DIR}/progress.txt`** — Sprint Learnings specific to this problem
+
+{PASTE THE CURRENT CONTENTS OF global progress.txt, or "No global progress.txt yet"}
+{PASTE THE CURRENT CONTENTS OF ${PROBLEM_DIR}/progress.txt Sprint Learnings section, or "No per-problem progress yet"}
 
 ## LINEAR MCP RESTRICTION (CRITICAL)
 - You do NOT have permission to interact with Linear in ANY way.
@@ -1874,8 +1924,9 @@ should match the pattern for "Edge Cases". Never require exact string equality.
    these by reading the files directly before relying on them.}
 }
 
-## Accumulated Learnings (from progress.txt)
-{PASTE THE CURRENT CONTENTS OF progress.txt — especially the Codebase Patterns section}
+## Accumulated Learnings (from progress files)
+{PASTE THE CURRENT CONTENTS OF global progress.txt — Codebase Patterns section}
+{PASTE THE CURRENT CONTENTS OF ${PROBLEM_DIR}/progress.txt — Sprint Learnings section}
 
 ## Sprint-Local Learnings (from tickets completed THIS sprint)
 {IF INTRA_SPRINT_LEARNINGS buffer is not empty:
@@ -2104,7 +2155,9 @@ Include this evidence in your WORKER_RESULT. Without it, the task is NOT done.
 - Immutable patterns only — never mutate objects
 
 ## LEARNING OUTPUT (RALPH PATTERN)
-Before finishing, append your learnings to progress.txt:
+Before finishing, append your learnings to the appropriate progress file:
+- **Codebase-wide patterns** → global `progress.txt` (repo root)
+- **Problem-specific learnings** → `${PROBLEM_DIR}/progress.txt`
   ## {TICKET_ID} — {TICKET_TITLE} [{timestamp}]
   - Files changed: {list}
   - Branch: worktree-{name}
@@ -2113,7 +2166,7 @@ Before finishing, append your learnings to progress.txt:
   - Evidence: build ✓ | lint ✓ | typecheck ✓ | tests ✓ ({N} passing)
 
 If you discovered a REUSABLE pattern (not ticket-specific), also add it to the
-"Codebase Patterns" section at the top of progress.txt.
+"Codebase Patterns" section of global progress.txt, or "Sprint Learnings" section of ${PROBLEM_DIR}/progress.txt.
 
 ## Final Output Format (REQUIRED)
 WORKER_RESULT:
@@ -2680,7 +2733,7 @@ You may NOT claim this ticket is complete unless you have:
 {IF PROBLEM_STATEMENT_LOADED:
   These are the overall success criteria the user defined for the feature.
   Check which criteria THIS ticket is responsible for and verify them:
-  {PASTE relevant success criteria from .claude/problem-statement.md}
+  {PASTE relevant success criteria from ${PROBLEM_DIR}/problem-statement.md}
   If this ticket doesn't cover any success criteria, note "N/A — this ticket
   is infrastructure/internal" and continue with ticket-level requirements only.
 }
@@ -3152,7 +3205,7 @@ If the orchestrator detects it has been through a compaction event (context feel
 thin, sprint-state.json exists but ticket data isn't in memory):
 
 ```
-1. Read .claude/sprint-state.json
+1. Read ${PROBLEM_DIR}/sprint-state.json
 2. Read progress.txt for accumulated learnings
 
 3. ROLLBACK SAFETY: Reconcile sprint-state against actual Linear state.
@@ -3788,7 +3841,7 @@ the running application and verify the feature works end-to-end.
   ## User Journey Scenarios (from /define)
   The user defined these as their expected experience when the feature is complete.
   Test EACH step as a browser interaction:
-  {PASTE user journey steps from .claude/problem-statement.md}
+  {PASTE user journey steps from ${PROBLEM_DIR}/problem-statement.md}
   Each step = one agent-browser interaction sequence with evidence capture.
 }
 
@@ -3999,7 +4052,7 @@ extract_nouns_and_key_phrases(text):
 ```
 
 ```
-{IF .claude/problem-statement.md exists:
+{IF ${PROBLEM_DIR}/problem-statement.md exists:
 
   # 1. Extract success criteria from problem statement
   success_criteria = extract_section("Success Criteria")
@@ -4111,7 +4164,7 @@ extract_nouns_and_key_phrases(text):
                   Match result: {severity or "no match"}
 
                   ## Problem Statement Reference
-                  See .claude/problem-statement.md → section: {relevant section name}
+                  See ${PROBLEM_DIR}/problem-statement.md → section: {relevant section name}
           LOG: "Created follow-up ticket for gap: {gap}"
       echo "Created {N} follow-up tickets with label 'sprint-followup'"
   else:
@@ -4130,7 +4183,7 @@ Update sprint-state.json: `current_phase = "7.5-completeness"`
 
 ## SPRINT DASHBOARD (Observability)
 
-If `SPRINT_DASHBOARD: true`, the orchestrator writes `.claude/sprint-dashboard.md`
+If `SPRINT_DASHBOARD: true`, the orchestrator writes `${PROBLEM_DIR}/sprint-dashboard.md`
 after every phase transition and every ticket state change. This file is:
 - Readable by `sprint-wave.sh` for headless monitoring
 - Readable by the user to check progress without interrupting the sprint
@@ -4179,7 +4232,7 @@ Phase: {current_phase} | Elapsed: {hh:mm:ss} | Mode: {COORDINATION_MODE}
 - Ticket state change → update dashboard
 - Circuit breaker trigger → update dashboard
 - Merge complete/fail → update dashboard
-- Write to `.claude/sprint-dashboard.md` (not committed, just a live file)
+- Write to `${PROBLEM_DIR}/sprint-dashboard.md` (not committed, just a live file)
 
 ---
 
@@ -4201,15 +4254,15 @@ You are the SPRINT RETROSPECTIVE AGENT. The sprint has ended.
 Analyze what happened and extract learnings for future sprints.
 
 ## Sprint Data
-{READ .claude/sprint-state.json}
-{READ .claude/sprint-dashboard.md}
+{READ ${PROBLEM_DIR}/sprint-state.json}
+{READ ${PROBLEM_DIR}/sprint-dashboard.md}
 {READ progress.txt}
 
 ## Analysis Required
 
 ### 0. Problem Statement Comparison
-{IF .claude/problem-statement.md exists:
-  READ .claude/problem-statement.md
+{IF ${PROBLEM_DIR}/problem-statement.md exists:
+  READ ${PROBLEM_DIR}/problem-statement.md
 
   Compare the sprint's actual outcomes against the problem statement:
   a) USER JOURNEY COVERAGE: For each step in the User Journey section,
@@ -4225,7 +4278,7 @@ Analyze what happened and extract learnings for future sprints.
     YELLOW = Minor gaps (1-2 partially met criteria or partially delivered features)
     RED    = Significant gaps (missing user journey steps or unmet success criteria)
 }
-{IF .claude/problem-statement.md does not exist:
+{IF ${PROBLEM_DIR}/problem-statement.md does not exist:
   "No problem statement available — skipping alignment check.
    Tip: Run /define → /tickets → /sprint for full traceability."
 }
@@ -4497,12 +4550,12 @@ for port in 3000 3001 5173 8080; do
 done
 
 # 5. Archive sprint-state.json alongside the retrospective
-if [ -f .claude/sprint-state.json ]; then
-  sprint_id=$(jq -r '.sprint_id // "unknown"' .claude/sprint-state.json 2>/dev/null)
+if [ -f ${PROBLEM_DIR}/sprint-state.json ]; then
+  sprint_id=$(jq -r '.sprint_id // "unknown"' ${PROBLEM_DIR}/sprint-state.json 2>/dev/null)
   mkdir -p .claude/sprint-history
-  cp .claude/sprint-state.json ".claude/sprint-history/sprint-state-${sprint_id}.json"
+  cp ${PROBLEM_DIR}/sprint-state.json ".claude/sprint-history/sprint-state-${sprint_id}.json"
   echo "Archived sprint-state.json → .claude/sprint-history/sprint-state-${sprint_id}.json"
-  rm .claude/sprint-state.json
+  rm ${PROBLEM_DIR}/sprint-state.json
 fi
 
 # 6. Final status
@@ -4517,6 +4570,8 @@ echo "Cleanup complete."
 ```
 [ ] Step 0-Pre: Context Pre-Flight Check
     [ ] Context window estimated (≥60% remaining?)
+    [ ] Step 0-Pre.5: Problem directory resolved (PROBLEM_DIR set)
+    [ ] Problem ID captured in sprint-state.json
     [ ] If <60%: user prompted with [Compact+Continue / Proceed / Cancel]
     [ ] If Compact: Steps 0A-0F.5 run, sprint-preflight.json written, compaction triggered
     [ ] If Resume: sprint-preflight.json loaded, freshness validated, state restored
@@ -4527,11 +4582,13 @@ echo "Cleanup complete."
     [ ] Baseline build passes
     [ ] Safety snapshot tagged
     [ ] .claude/worktrees/ in .gitignore
+    [ ] .claude/sprints/ in .gitignore
     [ ] Stale worktrees cleaned
-    [ ] progress.txt initialized
+    [ ] Global progress.txt initialized (codebase patterns)
+    [ ] Per-problem ${PROBLEM_DIR}/progress.txt initialized (sprint learnings)
     [ ] Failure pattern database loaded (.claude/failure-patterns.json)
     [ ] High-frequency patterns logged (if any ≥3 occurrences)
-    [ ] Problem statement loaded (if .claude/problem-statement.md exists from /define)
+    [ ] Problem statement loaded (if ${PROBLEM_DIR}/problem-statement.md exists from /define)
     [ ] User journey steps extracted for Phase 6 E2E scenarios
     [ ] Success criteria extracted for Layer 4 Completion Agent
     [ ] E2E tool availability checked (agent-browser installed → E2E_AVAILABLE=true/false)
@@ -4539,7 +4596,7 @@ echo "Cleanup complete."
     [ ] Agent Teams env flag verified (if Agent Teams mode)
     [ ] sprint-state.json initialized with all ticket entries
     [ ] INTRA_SPRINT_LEARNINGS buffer initialized (empty)
-    [ ] Sprint dashboard created (.claude/sprint-dashboard.md)
+    [ ] Sprint dashboard created (${PROBLEM_DIR}/sprint-dashboard.md)
     [ ] Pre-flight log includes coordination mode + sprint-state status
     [ ] Permission mode selected (auto-approve / skip-all / manual / pre-configured)
     [ ] If auto-approve: allowedTools config displayed, user confirmed
@@ -4669,7 +4726,8 @@ echo "Cleanup complete."
 [ ] Phase 8: Post-Sprint Learning Loop
     [ ] Retrospective Agent analyzed sprint-state.json + dashboard + progress.txt
     [ ] RETROSPECTIVE_REPORT generated (what worked, what failed, patterns)
-    [ ] progress.txt updated with sprint learnings
+    [ ] Global progress.txt updated with codebase-wide patterns
+    [ ] Per-problem ${PROBLEM_DIR}/progress.txt updated with sprint learnings
     [ ] Failure pattern database updated (.claude/failure-patterns.json — new + updated patterns)
     [ ] CLAUDE.md suggestions presented to user (applied only with approval)
     [ ] /tickets Explore agent memory updated (TICKETS_FEEDBACK)

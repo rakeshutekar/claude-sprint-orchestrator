@@ -1,5 +1,5 @@
 ---
-description: Define the problem statement, success criteria, and testing strategy through a structured dialogue. Produces .claude/problem-statement.md for /tickets and /sprint.
+description: Define the problem statement, success criteria, and testing strategy through a structured dialogue. Produces .claude/sprints/{problem_id}/problem-statement.md for /tickets and /sprint.
 ---
 
 
@@ -79,6 +79,36 @@ CODEBASE_CONTEXT = {
   project_description: "{from CLAUDE.md or README, 1-2 sentences}"
 }
 ```
+
+---
+
+## STEP 0.5: DERIVE PROBLEM ID
+
+If the user passed a problem ID as argument (`$ARGS`), use it directly as `PROBLEM_ID`.
+
+Otherwise, derive the problem ID **after Q1** (below):
+
+1. Take the user's Q1 answer (problem description)
+2. Extract 2-3 key words (e.g., "Users can't get notified" → "notification-system")
+3. Sanitize: lowercase, hyphens only, no leading/trailing hyphens, max 40 chars
+4. Confirm with user:
+   ```
+   Problem ID: `notification-system` — this scopes all sprint files under .claude/sprints/notification-system/.
+   OK, or would you like a different name?
+   ```
+5. Set variables:
+   ```
+   PROBLEM_ID = {confirmed value}
+   PROBLEM_DIR = .claude/sprints/${PROBLEM_ID}
+   ```
+6. Create directory:
+   ```bash
+   mkdir -p .claude/sprints/${PROBLEM_ID}
+   ```
+
+**If `$ARGS` was provided as a problem ID:**
+- Skip the derivation and confirmation — use `$ARGS` directly
+- Still create the directory in step 6
 
 ---
 
@@ -317,12 +347,13 @@ If yes, which services? If no, just say "none."
 
 After all questions are answered, generate the structured problem statement.
 
-### Output Format: `.claude/problem-statement.md`
+### Output Format: `${PROBLEM_DIR}/problem-statement.md`
 
 ```markdown
 # Problem Statement
 
 schema_version: 2
+problem_id: {PROBLEM_ID}
 generated_at: {ISO_TIMESTAMP}
 generated_commit: {$(git rev-parse HEAD)}
 Codebase: {CODEBASE_CONTEXT.stack}
@@ -435,15 +466,30 @@ criterion is missing (add it). /tickets uses this mapping to validate coverage.
 - Has API layer: {yes/no}
 ```
 
-### Post-Write: Gitignore Execution
+### Post-Write: Set Active Problem Marker
 
-After writing `.claude/problem-statement.md`, ensure it is gitignored:
+After writing the problem statement, set the active problem marker:
 
 ```bash
-# Add to .gitignore if not already present
-if ! grep -q "problem-statement.md" .gitignore 2>/dev/null; then
-  echo ".claude/problem-statement.md" >> .gitignore
-  echo "Added .claude/problem-statement.md to .gitignore"
+echo "${PROBLEM_ID}" > .claude/active-problem
+```
+
+This marker tells downstream commands (`/tickets`, `/sprint`, etc.) which problem to operate on
+without requiring the user to pass `--problem-id` every time.
+
+### Post-Write: Gitignore Execution
+
+After writing `${PROBLEM_DIR}/problem-statement.md`, ensure the sprint directories are gitignored:
+
+```bash
+# Add sprint directories to .gitignore if not already present
+if ! grep -q ".claude/sprints/" .gitignore 2>/dev/null; then
+  echo ".claude/sprints/" >> .gitignore
+  echo "Added .claude/sprints/ to .gitignore"
+fi
+if ! grep -q ".claude/active-problem" .gitignore 2>/dev/null; then
+  echo ".claude/active-problem" >> .gitignore
+  echo "Added .claude/active-problem to .gitignore"
 fi
 ```
 
@@ -460,12 +506,14 @@ Show the user the generated problem statement as a summary (don't dump the full 
 ✅ PROBLEM STATEMENT READY
 ═══════════════════════════════════════════════════════════════
 
+Problem ID: {PROBLEM_ID}
 Problem: {1-2 sentence summary}
 Done when: {3-4 key success criteria}
 Testing: {level} — {test types}
 Constraints: {brief list or "none"}
 
-Saved to: .claude/problem-statement.md
+Saved to: .claude/sprints/{PROBLEM_ID}/problem-statement.md
+Active problem set to: {PROBLEM_ID}
 
 Options:
   [1] Looks good — proceed to /tickets
@@ -477,12 +525,11 @@ Options:
 
 **If user chooses [1]:**
 ```
-echo "Launching /tickets with your problem statement as context..."
-echo "Tip: /tickets will automatically read .claude/problem-statement.md"
+echo "Problem saved to: .claude/sprints/{PROBLEM_ID}/problem-statement.md"
+echo "Active problem set to: {PROBLEM_ID}"
 echo ""
-echo "Copy and run this command:"
-echo ""
-echo '  /tickets "{one-line summary of the problem}"'
+echo "Run: /tickets \"{one-line summary of the problem}\""
+echo "(/tickets will automatically use the active problem \"{PROBLEM_ID}\")"
 echo ""
 echo "(You must run this yourself — /define cannot invoke /tickets directly.)"
 ```
@@ -492,9 +539,10 @@ Re-ask the specific question they want to change, regenerate the problem stateme
 
 **If user chooses [3]:**
 ```
-echo "Problem statement saved to .claude/problem-statement.md"
+echo "Problem statement saved to .claude/sprints/{PROBLEM_ID}/problem-statement.md"
+echo "Active problem: {PROBLEM_ID}"
 echo "When ready, run: /tickets \"{one-line problem summary}\""
-echo "/tickets will automatically detect and use the problem statement."
+echo "/tickets will automatically detect and use the active problem."
 ```
 
 ---
@@ -529,9 +577,9 @@ RULE 6: SAVE EVERYTHING
   The problem statement must be self-contained. /tickets and /sprint should be able
   to read it without needing any context from this conversation.
 
-RULE 7: GITIGNORE THE PROBLEM STATEMENT
-  Add .claude/problem-statement.md to .gitignore — it's a runtime planning file,
-  not code. (Same pattern as sprint-state.json and sprint-hints.json.)
+RULE 7: GITIGNORE SPRINT STATE
+  Add .claude/sprints/ and .claude/active-problem to .gitignore — they're runtime
+  planning files, not code. (Same pattern as sprint-state.json and sprint-hints.json.)
 ```
 
 ---
@@ -540,7 +588,8 @@ RULE 7: GITIGNORE THE PROBLEM STATEMENT
 
 ### What /define produces:
 ```
-.claude/problem-statement.md    # The structured problem statement
+.claude/sprints/{PROBLEM_ID}/problem-statement.md    # The structured problem statement
+.claude/active-problem                                # Marker file with current PROBLEM_ID
 ```
 
 ### What /tickets reads from it:
@@ -581,10 +630,16 @@ RULE 7: GITIGNORE THE PROBLEM STATEMENT
     [ ] Q4: Constraints captured (or explicitly "none")
     [ ] Q5-Q7: Decision trees evaluated (each: asked OR explicitly skipped with reason)
 
+[ ] Step 0.5: Problem ID derived
+    [ ] PROBLEM_ID set (from $ARGS, or derived from Q1 + user confirmed)
+    [ ] PROBLEM_DIR = .claude/sprints/${PROBLEM_ID}
+    [ ] Directory created: mkdir -p ${PROBLEM_DIR}
+
 [ ] Phase 2: Problem statement generated
-    [ ] .claude/problem-statement.md written
-    [ ] schema_version: 2 header present (with generated_at, generated_commit)
-    [ ] .gitignore updated (verified: grep -q "problem-statement.md" .gitignore)
+    [ ] ${PROBLEM_DIR}/problem-statement.md written
+    [ ] schema_version: 2 + problem_id header present (with generated_at, generated_commit)
+    [ ] .claude/active-problem written with PROBLEM_ID
+    [ ] .gitignore updated (verified: grep -q ".claude/sprints/" .gitignore)
     [ ] All required sections populated: Problem, Definition of Done, Testing Strategy, Constraints
     [ ] User journey → success criteria mapping complete (every step has ≥1 criterion)
     [ ] User journey → test scenarios mapping complete
@@ -592,9 +647,10 @@ RULE 7: GITIGNORE THE PROBLEM STATEMENT
 
 [ ] Phase 3: User confirmation and handoff
     [ ] Summary presented to user (not full markdown dump)
+    [ ] Problem ID displayed in summary
     [ ] User validated answers are correct
     [ ] User chose one option: [1] proceed / [2] edit / [3] save and stop
     [ ] If [2]: re-asked question, regenerated problem statement, re-confirmed
-    [ ] If [1]: /tickets copy-paste command displayed
+    [ ] If [1]: /tickets copy-paste command displayed with active problem note
     [ ] Problem statement is self-contained (readable without conversation context)
 ```

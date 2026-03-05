@@ -2,7 +2,7 @@
 
 A multi-agent sprint orchestration system for [Claude Code](https://docs.anthropic.com/en/docs/claude-code) that turns ideas into fully implemented, verified, and merged code, using Agent Teams (Context Agent + Worker Agent as live teammates) working in parallel isolated git worktrees.
 
-> **Three slash commands. One pipeline.** `/define` captures intent. `/tickets` plans your work. `/sprint` executes it.
+> **Five slash commands. One pipeline.** `/define` captures intent. `/tickets` plans your work. `/sprint-dry-run` validates readiness. `/sprint` executes it. `/sprint-resume` recovers from crashes.
 
 ---
 
@@ -17,6 +17,7 @@ The system is built around three Claude Code custom slash commands that form an 
   /define
       │
       │  Quick codebase recon → structured dialogue (3-5 min) →
+      │  derives problem ID → creates .claude/sprints/{id}/ →
       │  problem statement with success criteria, user journey,
       │  testing strategy, and constraints
       │
@@ -29,6 +30,13 @@ The system is built around three Claude Code custom slash commands that form an 
       │  validates all success criteria have ticket coverage
       │
       ▼
+  /sprint-dry-run  (optional but recommended)
+      │
+      │  Validates Linear tickets still match plan → computes deployment
+      │  waves → predicts file conflicts → checks infrastructure →
+      │  produces go/no-go verdict. Read-only, changes nothing.
+      │
+      ▼
   /sprint
       │
       │  Reads problem statement → fetches tickets → deploys Agent Teams →
@@ -36,7 +44,15 @@ The system is built around three Claude Code custom slash commands that form an 
       │  conflict-aware merging → E2E behavioral testing (using user
       │  journey as test scenarios) → auto-retrospective
       │
-      ▼
+      ├── (if interrupted) ──► /sprint-resume
+      │                            │
+      │                            │  Reconciles sprint-state.json against Linear →
+      │                            │  classifies tickets via 8-cell matrix →
+      │                            │  re-deploys agents only for incomplete work →
+      │                            │  skips already-done tickets (zero cost)
+      │                            │
+      │                            ▼
+      ▼                     Recovered sprint
    Merged, verified, tested code on your branch
 ```
 
@@ -50,8 +66,9 @@ The intent capture command. Through a focused 3-5 minute dialogue (informed by a
 
 1. **Quick codebase recon** (~10 seconds, silent) — Detects stack, test infrastructure, database/auth presence, and key directories. No agents, no deep reads — just enough to ask informed questions.
 2. **Structured dialogue** (4-7 questions) — Asks one question at a time, adapting follow-ups based on codebase context and previous answers.
-3. **Problem statement generation** — Produces `.claude/problem-statement.md` with problem description, user journey, success criteria, testing strategy, constraints, and codebase snapshot.
-4. **Handoff** — Offers to launch `/tickets` immediately or save for later.
+3. **Problem ID derivation** — Derives a short, hyphenated problem ID from the problem description (e.g., `notification-system`). Confirms with the user.
+4. **Problem statement generation** — Produces `.claude/sprints/{problem_id}/problem-statement.md` with problem description, user journey, success criteria, testing strategy, constraints, and codebase snapshot. Sets `.claude/active-problem` marker.
+5. **Handoff** — Offers to launch `/tickets` immediately or save for later.
 
 ### Core Questions
 
@@ -232,6 +249,31 @@ Each ticket created on Linear includes:
 | **Test Patterns** | Existing test conventions with example structure |
 | **Rollback Plan** | How to undo if it breaks (schema/migration tickets) |
 | **Sizing** | S/M/L with estimated files and tests |
+
+---
+
+## `/sprint-dry-run` — Sprint Readiness Audit
+
+The pre-validation command. Validates every prerequisite, predicts conflicts, and surfaces risks BEFORE agents spawn. Changes nothing — no files created, no commits, no state mutations.
+
+### What It Does
+
+1. **Preflight validation** — Parses sprint-hints.json (required), validates schema, checks plan staleness (commits since plan generation, files changed vs ticket file lists)
+2. **Linear reconciliation** — Fetches every ticket from Linear, cross-references against sprint-hints.json. Detects: missing tickets, title drift, already-Done tickets, orphans not in the plan, dependency mismatches
+3. **Deployment wave computation** — Builds dependency graph, runs topological sort, detects cycles (with exact chain reporting), computes wave statistics and agent window estimates
+4. **File conflict analysis** — Builds file ownership map, computes CONFLICT_MATRIX (CRITICAL/HIGH/MEDIUM/LOW), verifies files exist on disk, detects ghost dependencies (importers not in any ticket scope)
+5. **Infrastructure checks** — Git state, build command availability (never executed), E2E tool presence, worktree readiness, stale sprint-state.json detection, failure pattern matching
+6. **Report generation** — Structured report with 5 sections, severity-grouped findings, mechanical verdict (READY / READY_WITH_WARNINGS / NOT_READY)
+
+### Key Features
+
+- **Read-only** — Zero side effects. No files created, no commits, no Linear updates, no agent spawning
+- **Precise staleness** — Counts exact commits since plan, lists specific changed files, cross-references against ticket file lists
+- **Pessimistic conflict prediction** — Two tickets modifying the same file in the same wave = HIGH, even if they might touch different functions
+- **Ghost dependency detection** — Greps for importers of modified files that aren't in any ticket's scope
+- **Interrupted sprint detection** — If stale sprint-state.json exists, prominently suggests `/sprint-resume`
+- **Mechanical verdict** — Go/no-go decision based on finding counts, not subjective judgment
+- **Fast** — Runs in ~30 seconds with zero cost beyond the orchestrator's own context
 
 ---
 
@@ -452,9 +494,52 @@ The execution command. Fetches tickets from Linear, deploys Agent Teams per tick
 
 ---
 
+## `/sprint-resume` — Sprint Crash Recovery
+
+The recovery command. When a terminal crashes, context window compacts, or a session expires mid-sprint, `/sprint-resume` picks up exactly where things left off. It reconciles local state against Linear, classifies every ticket's recovery action, and re-deploys agents only for incomplete work.
+
+### What It Does
+
+1. **Recovery preflight** — Parses sprint-state.json (required), loads supporting files (hints, problem statement, progress.txt), restores INTRA_SPRINT_LEARNINGS, verifies infrastructure
+2. **Deep reconciliation** — Fetches every ticket from Linear (status + comments), classifies each using the 8-cell matrix, audits worktree branches, displays summary, gets user confirmation
+3. **Permission mode** — Always asked fresh (never cached from prior sprint)
+4. **Selective re-deployment** — SKIP tickets get zero agents. RE_VERIFY tickets skip to verification. RE_IMPLEMENT tickets get full agent teams (with recovery context). REPAIR_STATUS tickets get status fixes only.
+5. **Verification loop** — Delegates to /sprint Phase 3 exactly (Layers 0.5→5.5)
+6. **Merge & build gate** — Skips already-merged tickets, merges only newly completed work
+7. **E2E & wrap-up** — Delegates to /sprint Phase 6→8, retrospective includes recovery metadata
+
+### The 8-Cell Classification Matrix
+
+Every ticket is classified by two dimensions: sprint-state status (complete/stuck/other) and Linear reality (Done+evidence / Done-evidence / !Done+evidence / !Done-evidence):
+
+| | Linear=Done + evidence | Linear=Done - evidence | Linear!=Done + evidence | Linear!=Done - evidence |
+|---|---|---|---|---|
+| **state=complete** | SKIP | RE_VERIFY | REPAIR_STATUS | RE_VERIFY |
+| **state=stuck** | SKIP | SKIP | STUCK | STUCK |
+| **state=other** | SKIP | SKIP | RE_IMPLEMENT | RE_IMPLEMENT |
+
+- **SKIP** — Genuinely complete. Zero agents. Zero cost.
+- **RE_VERIFY** — Re-run verification only. No re-implementation.
+- **RE_IMPLEMENT** — Full agent team. Checks existing worktree branch first.
+- **STUCK** — Left alone unless user explicitly requests re-attempt.
+- **REPAIR_STATUS** — Post missing evidence or fix Linear status. No re-implementation.
+
+### Key Features
+
+- **Surgical recovery** — Only re-deploys agents for genuinely incomplete work
+- **Cost savings** — Skipping 5 already-done tickets saves ~$25-75 vs a fresh sprint
+- **Self-resumable** — sprint-state.json is updated after every state change, so the recovery itself is recoverable
+- **Evidence verification** — Doesn't trust evidence comments blindly; verifies referenced branches/commits still exist
+- **Worktree branch recovery** — Detects if branches survived the crash; resumes in existing worktree or creates fresh
+- **Cross-ticket learning preservation** — Restores INTRA_SPRINT_LEARNINGS from progress.txt
+- **Base branch drift handling** — Detects and rebases if BRANCH_BASE moved since sprint start
+- **Same model policy** — Sonnet for context/verification, Opus for implementation. No Haiku.
+
+---
+
 ## Guardrails
 
-Both commands share a philosophy of **evidence before assertion**:
+All commands share a philosophy of **evidence before assertion**:
 
 ### Verification Philosophy (6 Rules)
 
@@ -505,6 +590,8 @@ Raw terminal output IS proof. Agent-written summaries are NOT proof. The orchest
 mkdir -p your-project/.claude/commands
 cp .claude/commands/define-problem.md your-project/.claude/commands/
 cp .claude/commands/orchestrate-parallel-sprint.md your-project/.claude/commands/
+cp .claude/commands/sprint-dry-run.md your-project/.claude/commands/
+cp .claude/commands/sprint-resume.md your-project/.claude/commands/
 cp .claude/commands/tickets.md your-project/.claude/commands/
 ```
 
@@ -513,6 +600,8 @@ cp .claude/commands/tickets.md your-project/.claude/commands/
 git clone https://github.com/rakeshutekar/claude-sprint-orchestrator.git
 ln -s $(pwd)/claude-sprint-orchestrator/.claude/commands/define-problem.md your-project/.claude/commands/
 ln -s $(pwd)/claude-sprint-orchestrator/.claude/commands/orchestrate-parallel-sprint.md your-project/.claude/commands/
+ln -s $(pwd)/claude-sprint-orchestrator/.claude/commands/sprint-dry-run.md your-project/.claude/commands/
+ln -s $(pwd)/claude-sprint-orchestrator/.claude/commands/sprint-resume.md your-project/.claude/commands/
 ln -s $(pwd)/claude-sprint-orchestrator/.claude/commands/tickets.md your-project/.claude/commands/
 ```
 
@@ -523,9 +612,11 @@ ln -s $(pwd)/claude-sprint-orchestrator/.claude/commands/tickets.md your-project
 # Select the Linear server and complete OAuth
 ```
 
-3. Verify `.claude/worktrees/` is in your `.gitignore`:
+3. Verify `.claude/worktrees/` and `.claude/sprints/` are in your `.gitignore`:
 ```bash
 echo ".claude/worktrees/" >> .gitignore
+echo ".claude/sprints/" >> .gitignore
+echo ".claude/active-problem" >> .gitignore
 ```
 
 ---
@@ -538,7 +629,7 @@ echo ".claude/worktrees/" >> .gitignore
 /define
 ```
 
-This starts a 3-5 minute structured dialogue. It scans your codebase (quick recon), then asks 4-7 focused questions about what you're building, what "done" looks like, and how you want it tested. Produces `.claude/problem-statement.md`.
+This starts a 3-5 minute structured dialogue. It scans your codebase (quick recon), then asks 4-7 focused questions about what you're building, what "done" looks like, and how you want it tested. Derives a problem ID (e.g., `notification-system`) and produces `.claude/sprints/{problem_id}/problem-statement.md`. Sets the active problem marker so downstream commands auto-detect it.
 
 ### Step 1: Generate Tickets
 
@@ -549,7 +640,15 @@ This starts a 3-5 minute structured dialogue. It scans your codebase (quick reco
 
 This will analyze your codebase (using the problem statement for focus if available), generate a plan, validate all success criteria have ticket coverage, and after your approval, create tickets on Linear with full context.
 
-### Step 2: Run the Sprint
+### Step 2: Pre-Validate (Recommended)
+
+```
+/sprint-dry-run
+```
+
+This validates all Linear tickets still match the plan, computes deployment waves, predicts file conflicts, checks infrastructure, and produces a go/no-go verdict. Takes ~30 seconds, changes nothing, and can save you from expensive surprises.
+
+### Step 3: Run the Sprint
 
 Copy the sprint config output from `/tickets` and run:
 
@@ -597,6 +696,16 @@ Now execute the orchestration.
 | `PARTIAL_MERGE` | No | `true` | Merge completed tickets even if some are stuck |
 | `SPRINT_DASHBOARD` | No | `true` | Write live sprint-dashboard.md |
 
+### Step 4: Recover from Crashes (If Needed)
+
+If the terminal crashes or the session expires mid-sprint:
+
+```
+/sprint-resume
+```
+
+This reconciles sprint-state.json against Linear, classifies every ticket using the 8-cell matrix (SKIP/RE_VERIFY/RE_IMPLEMENT/STUCK/REPAIR_STATUS), and re-deploys agents only for incomplete work. Already-done tickets get zero agents.
+
 ---
 
 ## Coordination Modes
@@ -632,21 +741,87 @@ your-project/
 │   ├── commands/
 │   │   ├── define-problem.md                # /define command (~600 lines)
 │   │   ├── orchestrate-parallel-sprint.md   # /sprint command (4600+ lines)
+│   │   ├── sprint.md                        # /sprint thin wrapper (~140 lines)
+│   │   ├── sprint-dry-run.md                # /sprint-dry-run command (~500 lines)
+│   │   ├── sprint-resume.md                 # /sprint-resume command (~920 lines)
 │   │   └── tickets.md                       # /tickets command (1800+ lines)
+│   ├── active-problem                       # Current problem ID (one line, e.g. "auth-system")
 │   ├── worktrees/                           # Auto-created, must be in .gitignore
-│   ├── problem-statement.md                 # From /define — intent contract (auto-created)
-│   ├── sprint-state.json                    # Sprint checkpoint (auto-created)
-│   ├── sprint-preflight.json                # Context pre-flight checkpoint (temporary)
-│   ├── sprint-dashboard.md                  # Live status (auto-created)
-│   ├── sprint-history/                      # Retrospective archive (auto-created)
+│   ├── sprints/                             # Per-problem state directories (auto-created)
+│   │   └── {problem_id}/
+│   │       ├── problem-statement.md         # From /define — intent contract
+│   │       ├── sprint-state.json            # Sprint checkpoint
+│   │       ├── sprint-hints.json            # From /tickets — ticket metadata
+│   │       ├── sprint-preflight.json        # Context pre-flight checkpoint (temporary)
+│   │       ├── sprint-dashboard.md          # Live sprint status
+│   │       ├── progress.txt                 # Per-problem sprint learnings
+│   │       └── agent-memory/
+│   │           └── tickets-explore/         # Persistent Explore agent memory
+│   ├── sprint-config.yml                    # Global: shared build cmds, model policy
+│   ├── sprint-history/                      # Global: retrospective archive (auto-created)
 │   │   └── sprint-{timestamp}.md
-│   ├── failure-patterns.json                # Cross-sprint error→resolution DB
-│   ├── plans/                               # Saved ticket plans (auto-created)
-│   └── agent-memory/
-│       └── tickets-explore/                 # Persistent Explore agent memory
-├── progress.txt                             # Shared memory across agents (Ralph Pattern)
-└── .gitignore                               # Must include .claude/worktrees/
+│   ├── failure-patterns.json                # Global: cross-sprint error→resolution DB
+│   └── plans/                               # Saved ticket plans (auto-created)
+├── progress.txt                             # Global: codebase patterns (Ralph Pattern)
+├── scripts/
+│   └── sprint-wave.sh                       # Optional: bash sprint launcher
+└── .gitignore                               # Must include .claude/sprints/ and .claude/worktrees/
 ```
+
+---
+
+## Multi-Problem Support
+
+The orchestrator supports running `/define` → `/tickets` → `/sprint` pipelines for multiple features concurrently in the same project without file collisions.
+
+### How It Works
+
+Each feature gets its own **problem directory** under `.claude/sprints/{problem_id}/` containing all sprint state files (problem statement, sprint state, hints, dashboard, progress). Global infrastructure (build commands, failure patterns, sprint history) stays shared.
+
+**Problem ID propagation** uses a hybrid approach:
+1. `/define` derives a problem ID from the feature description (e.g., `notification-system`) and writes it to `.claude/active-problem`
+2. Downstream commands (`/tickets`, `/sprint-dry-run`, `/sprint`) auto-read the active problem marker
+3. Once a sprint starts, the problem ID is captured in `sprint-state.json` — the running sprint never re-reads `active-problem`, making it safe to `/define` a new problem while a sprint is running
+
+### Resolution Logic
+
+Every command uses a 5-step resolution at startup:
+
+1. If user provided a problem ID as argument → use it
+2. Else if `.claude/active-problem` exists → use its contents
+3. Else if exactly one directory under `.claude/sprints/` → use it
+4. Else if legacy singleton files exist (`.claude/problem-statement.md` etc.) → auto-migrate to `.claude/sprints/default/`
+5. Else → hard stop with guidance
+
+### Two-Tier Progress
+
+- **Global** `progress.txt` (repo root) — codebase patterns, build quirks, and conventions discovered across all sprints
+- **Per-problem** `.claude/sprints/{id}/progress.txt` — completed tickets and sprint-specific learnings for that feature
+
+Agents read both files: global patterns inform codebase navigation, per-problem progress prevents re-doing completed work.
+
+### Concurrent Sprint Example
+
+```bash
+# Terminal 1: Define and sprint feature A
+/define                              # → derives "auth-system", creates .claude/sprints/auth-system/
+/tickets "Build auth system"         # → reads from .claude/sprints/auth-system/
+/sprint                              # → locked to auth-system for its entire lifecycle
+
+# Terminal 2: While sprint A is running, define feature B
+/define                              # → derives "notification-system", updates active-problem marker
+/tickets "Build notifications"       # → reads from .claude/sprints/notification-system/
+/sprint                              # → locked to notification-system, independent of sprint A
+```
+
+### Backwards Compatibility
+
+| Scenario | What Happens |
+|----------|-------------|
+| Fresh repo, no state files | `/define` creates `.claude/sprints/{id}/` from scratch |
+| Existing singleton files (pre-migration) | Auto-migrated to `.claude/sprints/default/` on first command run |
+| Only one problem exists | Works exactly like before — no extra ceremony |
+| `/sprint-resume` with 2 interrupted sprints | Presents a list and asks which to resume |
 
 ---
 
@@ -686,7 +861,7 @@ Plus global agents: Scheduler, Conflict Resolution, Build Gate, Retrospective.
 3. **Set `MAX_LOOP_ITERATIONS: 2`** — Lower the retry cap
 4. **Use Subagents mode** — Lower cost than Agent Teams
 5. **Check the sprint dashboard** — Monitor `.claude/sprint-dashboard.md` to catch issues early
-6. **Use `/tickets` dry-run** — Review the plan before committing to a full sprint
+6. **Run `/sprint-dry-run`** — Validate tickets, predict conflicts, and check infrastructure before committing to a full sprint
 
 ---
 
