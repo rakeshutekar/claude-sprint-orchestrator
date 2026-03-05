@@ -605,11 +605,10 @@ cat > .claude/sprint-preflight.json << 'PREFLIGHTEOF'
   },
 
   "user_choices": {
-    "coordination_mode": "{agent-teams or subagents — from Step 0G, or null if not yet chosen}",
-    "permission_mode": "{auto-approve or skip-all or manual or pre-configured — from Step 0J, or null if not yet chosen}"
+    "coordination_mode": "{agent-teams or subagents — from Step 0G, or null if not yet chosen}"
   },
 
-  "resume_instructions": "Load this file, skip Step 0A-0F.7. If user_choices.coordination_mode is set, also skip Step 0G. If user_choices.permission_mode is set, also skip Step 0J. Re-read orchestrate-parallel-sprint.md for behavioral rules, then proceed to the first unskipped step."
+  "resume_instructions": "Load this file, skip Step 0A-0F.7. If user_choices.coordination_mode is set, also skip Step 0G. Always run Step 0J (permission mode is never cached). Re-read orchestrate-parallel-sprint.md for behavioral rules, then proceed to the first unskipped step."
 }
 PREFLIGHTEOF
 
@@ -677,10 +676,7 @@ if [ -f .claude/sprint-preflight.json ]; then
         COORDINATION_MODE = USER_CHOICES.coordination_mode
         echo "   Coordination mode restored: ${COORDINATION_MODE}"
     fi
-    if USER_CHOICES.permission_mode is not null:
-        PERMISSION_MODE = USER_CHOICES.permission_mode
-        echo "   Permission mode restored: ${PERMISSION_MODE}"
-    fi
+    # Permission mode is NEVER restored — always ask fresh (tickets vary in risk)
 
     # Verify git state hasn't changed during compaction
     current_head=$(git rev-parse HEAD)
@@ -693,11 +689,8 @@ if [ -f .claude/sprint-preflight.json ]; then
       rm .claude/sprint-preflight.json
 
       # Determine resume point based on what was already completed
-      if COORDINATION_MODE is set AND PERMISSION_MODE is set:
-          echo "✅ State restored. Skipping to Phase 1 (all pre-flight + user choices restored)."
-          # SKIP to Phase 1
-      elif COORDINATION_MODE is set:
-          echo "✅ State restored. Skipping to Step 0J (permission mode selection)."
+      if COORDINATION_MODE is set:
+          echo "✅ State restored. Skipping to Step 0J (permission mode — always asked fresh)."
           # SKIP to Step 0J
       else:
           echo "✅ State restored. Skipping to Step 0G (coordination mode selection)."
@@ -1250,14 +1243,11 @@ Proceeding to Phase 1...
 ✅ Skipping permission setup. Proceeding to Phase 1...
 ```
 
-Store the choice in sprint-state.json:
-```json
-"permission_mode": "{auto-approve|skip-all|manual|pre-configured}"
-```
+**Do NOT store permission_mode in sprint-state.json.** This choice is made fresh every sprint because ticket complexity varies.
 
 ### Step 0K: Log Pre-Flight Results
 
-Now that ALL user choices are made (coordination mode + permission mode), log the complete summary:
+Now that ALL user choices are made (coordination mode from state + permission mode from prompt), log the complete summary:
 
 ```
 PRE-FLIGHT COMPLETE
