@@ -1290,12 +1290,19 @@ Fetch all issues from team {LINEAR_FILTER.team}
   and label = {LINEAR_FILTER.label} (if specified)
 
 For each ticket, extract:
-  - id (Linear issue ID, e.g., "CLA-15")
+  - identifier (Linear display ID, e.g., "CLA-15") — used for logs and display
+  - uuid (Linear internal UUID) — used for ALL MCP API calls
   - title
   - description (full markdown body)
   - priority (1=urgent, 2=high, 3=medium, 4=low)
   - labels
   - assignee (optional)
+
+NOTE: The Linear MCP `list_issues` / `get_issue` response includes both:
+  - `identifier`: the human-readable ID like "CLA-15"
+  - `id`: the internal UUID like "a1b2c3d4-..."
+Store BOTH. Use `identifier` for logging/display. Use `uuid` for ALL MCP tool calls
+(save_comment, save_issue, get_issue, list_comments).
 ```
 
 Store as `TICKETS[]` array. Log count: "Found {N} tickets to process."
@@ -1309,7 +1316,9 @@ This ensures every downstream phase can safely read/write ticket state without u
 
 ```
 for each ticket in TICKETS[]:
-    sprint-state.json.tickets[ticket.id] = {
+    sprint-state.json.tickets[ticket.identifier] = {
+        "uuid": ticket.uuid,              # Internal UUID — ALL MCP calls use this
+        "identifier": ticket.identifier,   # Display ID (e.g., "CLA-15") — logs only
         "title": ticket.title,
         "status": "queued",              # Lifecycle: queued → context → implementing → verifying → done | stuck
         "wave": ticket.wave,             # Implementation Wave from /tickets plan (1-4), or null if not from /tickets
@@ -2740,7 +2749,8 @@ while loop_count < MAX_LOOPS:
             ticket_state = "stuck"
             update sprint-state.json: tickets[{TICKET_ID}].status = "stuck"
             update sprint-state.json: tickets[{TICKET_ID}].stuck_reason = last_error.message
-            ORCHESTRATOR calls Linear MCP save_comment(issueId: {TICKET_ID}, body: "## Stuck — Needs Manual Intervention\n\nFailed {loop_count}x on: {last_error.message}\nCircuit breaker triggered after fresh agent also failed.")
+            TICKET_UUID = sprint-state.json.tickets[{TICKET_ID}].uuid
+            ORCHESTRATOR calls Linear MCP save_comment(issueId: {TICKET_UUID}, body: "## Stuck — Needs Manual Intervention\n\nFailed {loop_count}x on: {last_error.message}\nCircuit breaker triggered after fresh agent also failed.")
             break
 
     # ─── ERROR CLASSIFICATION ───
@@ -2951,6 +2961,11 @@ while loop_count < MAX_LOOPS:
 
     if completion.STATUS == "COMPLETE":
 
+        # ─── Resolve UUID for MCP calls ───
+        # TICKET_ID is the display identifier (e.g., "CLA-15") used in logs.
+        # TICKET_UUID is the internal Linear UUID used for ALL MCP API calls.
+        TICKET_UUID = sprint-state.json.tickets[{TICKET_ID}].uuid
+
         # ─── Layer 5: ORCHESTRATOR ASSEMBLES & POSTS EVIDENCE (HARD GATE) ───
         # No agent posts to Linear. The ORCHESTRATOR assembles raw proof from
         # Task tool returns and posts it directly. This eliminates fabrication.
@@ -2995,14 +3010,14 @@ while loop_count < MAX_LOOPS:
         # ORCHESTRATOR posts the comment directly via Linear MCP
         # Use the Linear MCP `save_comment` tool with issueId and body parameters.
         # Tool name: `mcp__plugin_linear_linear__save_comment` (issueId + body).
-        post_result = ORCHESTRATOR calls Linear MCP save_comment(issueId: {TICKET_ID}, body: evidence_comment)
+        post_result = ORCHESTRATOR calls Linear MCP save_comment(issueId: {TICKET_UUID}, body: evidence_comment)
 
         if post_result FAILED:
             LOG ERROR: "LAYER 5 HARD GATE FAILED: Could not post evidence comment to Linear"
             LOG ERROR: "Linear API error: {post_result.error}"
             # Retry once after 5 seconds
             WAIT 5 seconds
-            post_result = ORCHESTRATOR retries Linear MCP save_comment(issueId: {TICKET_ID}, body: evidence_comment)
+            post_result = ORCHESTRATOR retries Linear MCP save_comment(issueId: {TICKET_UUID}, body: evidence_comment)
             if post_result FAILED:
                 LOG ERROR: "LAYER 5 RETRY FAILED — flagging ticket for manual intervention"
                 last_error = { type: "linear_api_failure", message: "Cannot post evidence to Linear" }
@@ -3010,24 +3025,47 @@ while loop_count < MAX_LOOPS:
                 update sprint-state.json: tickets[{TICKET_ID}].status = "stuck"
                 break
 
-        LOG: "Layer 5 PASSED: Evidence comment posted to Linear by ORCHESTRATOR for {TICKET_ID}"
+        # ─── Layer 5 VERIFY: Confirm comment actually exists on Linear ───
+        # Mirror Layer 5.5's verify pattern: write → wait → read → confirm
+        WAIT 2 seconds  # Give Linear API time to propagate
+
+        comments = ORCHESTRATOR calls Linear MCP list_comments(issueId: {TICKET_UUID})
+        evidence_found = any comment in comments where body contains "## Implementation Complete"
+
+        if NOT evidence_found:
+            LOG ERROR: "LAYER 5 VERIFY FAILED: Comment posted but not found on Linear for {TICKET_ID}"
+            # Retry: post again and re-verify
+            WAIT 3 seconds
+            post_result = ORCHESTRATOR calls Linear MCP save_comment(issueId: {TICKET_UUID}, body: evidence_comment)
+            WAIT 2 seconds
+            comments = ORCHESTRATOR calls Linear MCP list_comments(issueId: {TICKET_UUID})
+            evidence_found = any comment in comments where body contains "## Implementation Complete"
+
+            if NOT evidence_found:
+                LOG ERROR: "LAYER 5 VERIFY RETRY FAILED — evidence comment missing after 2 attempts"
+                last_error = { type: "evidence_not_verified", message: "Comment posted but not retrievable from Linear" }
+                ticket_state = "stuck"
+                update sprint-state.json: tickets[{TICKET_ID}].status = "stuck"
+                break
+
+        LOG: "Layer 5 PASSED: Evidence comment posted AND VERIFIED on Linear for {TICKET_ID}"
 
         # ─── Layer 5.5: ORCHESTRATOR MARKS DONE & VERIFIES STATUS (HARD GATE) ───
         # Orchestrator changes ticket status to Done directly.
         # Use the Linear MCP `save_issue` tool to update status.
         # Tool name: `mcp__plugin_linear_linear__save_issue` (id + state: "Done").
-        ORCHESTRATOR calls Linear MCP save_issue(id: {TICKET_ID}, state: "Done")
+        ORCHESTRATOR calls Linear MCP save_issue(id: {TICKET_UUID}, state: "Done")
         WAIT 2 seconds  # Give Linear API time to propagate
 
         # Verify the status actually changed
-        ticket_status = ORCHESTRATOR calls Linear MCP get_issue(id: {TICKET_ID}) → status
+        ticket_status = ORCHESTRATOR calls Linear MCP get_issue(id: {TICKET_UUID}) → status
 
         if ticket_status != "Done":
             LOG ERROR: "LAYER 5.5 HARD GATE FAILED: Ticket {TICKET_ID} status is '{ticket_status}', not 'Done'"
             # Retry once
-            ORCHESTRATOR calls Linear MCP save_issue(id: {TICKET_ID}, state: "Done")
+            ORCHESTRATOR calls Linear MCP save_issue(id: {TICKET_UUID}, state: "Done")
             WAIT 3 seconds
-            ticket_status = ORCHESTRATOR fetches {TICKET_ID} status via Linear MCP
+            ticket_status = ORCHESTRATOR calls Linear MCP get_issue(id: {TICKET_UUID}) → status
             if ticket_status != "Done":
                 LOG ERROR: "LAYER 5.5 RETRY FAILED — status still '{ticket_status}'"
                 last_error = { type: "ticket_not_done", message: "Cannot mark Done on Linear" }
@@ -3095,7 +3133,8 @@ while loop_count < MAX_LOOPS:
 if loop_count >= MAX_LOOPS:
     ticket_state = "stuck"
     update sprint-state.json: tickets[{TICKET_ID}].status = "stuck"
-    ORCHESTRATOR calls Linear MCP save_comment(issueId: {TICKET_ID}, body: "## Max Verification Loops Reached\n\nAttempts: {loop_count}/{MAX_LOOPS}\nLast error: {last_error.type} — {last_error.message}\nManual review needed.")
+    TICKET_UUID = sprint-state.json.tickets[{TICKET_ID}].uuid
+    ORCHESTRATOR calls Linear MCP save_comment(issueId: {TICKET_UUID}, body: "## Max Verification Loops Reached\n\nAttempts: {loop_count}/{MAX_LOOPS}\nLast error: {last_error.type} — {last_error.message}\nManual review needed.")
 
 # ─── ORCHESTRATOR SELF-HEALTH MONITORING ───
 # The orchestrator monitors workers for context exhaustion but must also
@@ -3158,12 +3197,13 @@ thin, sprint-state.json exists but ticket data isn't in memory):
    sprint-state.json NOR agent memory — verify everything against Linear.
 
    for each ticket in sprint-state.json:
+         TICKET_UUID = sprint-state.json.tickets[{TICKET_ID}].uuid
 
      # ─── CASE A: sprint-state says "complete" ───
      if status == "complete":
          # Verify it's ACTUALLY complete on Linear
-         linear_status = ORCHESTRATOR fetches {TICKET_ID} status via Linear MCP
-         linear_comments = ORCHESTRATOR fetches comments on {TICKET_ID} via Linear MCP
+         linear_status = ORCHESTRATOR calls Linear MCP get_issue(id: {TICKET_UUID}) → status
+         linear_comments = ORCHESTRATOR calls Linear MCP list_comments(issueId: {TICKET_UUID})
          evidence_comment = find comment containing "## Implementation Complete"
 
          if linear_status == "Done" AND evidence_comment EXISTS:
@@ -3184,12 +3224,12 @@ thin, sprint-state.json exists but ticket data isn't in memory):
                  LOG: "REPAIRED: Evidence comment posted for {TICKET_ID}"
              else:
                  LOG ERROR: "Cannot repair {TICKET_ID} — worktree branch gone. Manual check needed."
-                 ORCHESTRATOR calls Linear MCP save_comment(issueId: {TICKET_ID}, body: "## Recovery Note\nSprint crashed. Ticket marked Done but evidence comment may be missing. Manual verification recommended.")
+                 ORCHESTRATOR calls Linear MCP save_comment(issueId: {TICKET_UUID}, body: "## Recovery Note\nSprint crashed. Ticket marked Done but evidence comment may be missing. Manual verification recommended.")
 
          elif linear_status != "Done" AND evidence_comment EXISTS:
              LOG WARNING: "INCONSISTENT: {TICKET_ID} has evidence comment but status is '{linear_status}'"
              # Crash happened after posting comment but before marking Done
-             ORCHESTRATOR calls Linear MCP save_issue(id: {TICKET_ID}, state: "Done")
+             ORCHESTRATOR calls Linear MCP save_issue(id: {TICKET_UUID}, state: "Done")
              LOG: "REPAIRED: Marked {TICKET_ID} Done on Linear"
 
          elif linear_status != "Done" AND evidence_comment MISSING:
@@ -3208,7 +3248,7 @@ thin, sprint-state.json exists but ticket data isn't in memory):
      # ─── CASE C: sprint-state says "in_progress" ───
      elif status == "in_progress":
          # Check if it's further along than sprint-state thinks
-         linear_status = ORCHESTRATOR fetches {TICKET_ID} status via Linear MCP
+         linear_status = ORCHESTRATOR calls Linear MCP get_issue(id: {TICKET_UUID}) → status
          if linear_status == "Done":
              LOG WARNING: "AHEAD OF STATE: {TICKET_ID} is Done on Linear but sprint-state says in_progress"
              # An agent may have marked it Done directly (violating rules), or crash
@@ -3616,7 +3656,8 @@ Step 3: If Fix Agent fails {MAX_LOOP_ITERATIONS} times:
   Option A (PARTIAL_MERGE == true):
     - Revert the failing merge: git revert -m 1 {merge_commit}
     - Mark that ticket as "stuck" in sprint-state.json
-    - ORCHESTRATOR calls Linear MCP save_comment(issueId: {TICKET_ID}, body: "Build gate failed after merge. Reverted. Manual fix needed.")
+    - TICKET_UUID = sprint-state.json.tickets[{TICKET_ID}].uuid
+    - ORCHESTRATOR calls Linear MCP save_comment(issueId: {TICKET_UUID}, body: "Build gate failed after merge. Reverted. Manual fix needed.")
     - Continue sprint with remaining tickets
   Option B (PARTIAL_MERGE == false):
     - Flag for manual intervention

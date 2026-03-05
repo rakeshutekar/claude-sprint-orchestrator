@@ -133,7 +133,12 @@ To auto-approve sprint commands, add these to your
       "Bash(mkdir *)",
       "Bash(cp *)",
       "Bash(agent-browser *)",
-      "Bash(curl -sf http://localhost*)"
+      "Bash(curl -sf http://localhost*)",
+      "mcp__plugin_linear_linear__save_comment",
+      "mcp__plugin_linear_linear__save_issue",
+      "mcp__plugin_linear_linear__get_issue",
+      "mcp__plugin_linear_linear__list_comments",
+      "mcp__plugin_linear_linear__list_issues"
     ]
   }
 }
