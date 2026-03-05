@@ -19,8 +19,7 @@ BUILD_CMD: "npm run build"              # Build command
 LINT_CMD: "npm run lint"                # Lint command
 TEST_CMD: "npm run test:run"            # Unit test command
 TYPECHECK_CMD: "npx tsc --noEmit"      # Type check command (optional)
-E2E_CMD: "npx playwright test"          # Existing E2E test runner (optional, used in Phase 6 Step 2)
-                                        # Phase 6 Step 3 uses agent-browser CLI for primary browser verification
+E2E_CMD: "agent-browser"                # E2E verification via agent-browser CLI (Phase 6)
 COMMIT_PREFIX: "feat"                   # Conventional commit prefix
 MAX_LOOP_ITERATIONS: 3                  # Safety cap on fix-up loops
 HUMAN_IN_LOOP: false                    # true = pause for human review before marking Done
@@ -3625,10 +3624,10 @@ Spawn one E2E testing agent **per ticket**, all in parallel.
 These agents perform **behavioral verification** — they don't just run tests,
 they verify the feature actually works by interacting with the running application.
 
-**Uses `agent-browser` (Vercel) instead of Playwright for E2E browser interactions.**
-Agent-browser uses 82-93% less context than Playwright MCP (snapshot refs vs full DOM trees),
-leaving agents more room for actual verification logic. Each agent gets its own isolated
-session via `--session`, preventing the port collision issues of parallel Playwright instances.
+**Uses `agent-browser` (Vercel) for E2E browser interactions.**
+Agent-browser uses lightweight @ref snapshots instead of full DOM trees, leaving agents
+more room for actual verification logic. Each agent gets its own isolated session via
+`--session`, preventing port collision issues across parallel agents.
 
 ### Pre-Phase 6: Orchestrator starts ONE dev server
 
@@ -3688,8 +3687,8 @@ You must verify the feature BEHAVES correctly in a running application.
 {TICKET_DESCRIPTION}
 
 ## Tool: agent-browser (Vercel)
-You use `agent-browser` CLI for all browser interactions. It uses 82-93% less context
-than Playwright MCP by returning lightweight @ref snapshots instead of full DOM trees.
+You use `agent-browser` CLI for all browser interactions. It returns lightweight
+@ref snapshots instead of full DOM trees, keeping context usage minimal.
 
 ### Core Workflow: Navigate → Snapshot → Interact → Re-snapshot
 ```bash
@@ -3734,7 +3733,7 @@ curl -sf http://localhost:3000/api/health || echo "DEV SERVER NOT READY"
 ```
 
 ## Step 2: Run Existing E2E Tests
-If Playwright/Vitest E2E tests exist for this feature, run them:
+If existing E2E tests exist for this feature, run them:
 ```bash
 {E2E_CMD} --grep "{relevant test pattern}" 2>&1 || true
 ```
@@ -4604,7 +4603,7 @@ BUILD_CMD: "npm run build"
 LINT_CMD: "npm run lint"
 TEST_CMD: "npm run test:run"
 TYPECHECK_CMD: "npx tsc --noEmit"
-E2E_CMD: "npx playwright test"           # Existing test runner (Phase 6 Step 2); agent-browser handles Step 3
+E2E_CMD: "agent-browser"                 # E2E verification via agent-browser CLI (Phase 6)
 COMMIT_PREFIX: "feat"
 MAX_LOOP_ITERATIONS: 3
 HUMAN_IN_LOOP: false

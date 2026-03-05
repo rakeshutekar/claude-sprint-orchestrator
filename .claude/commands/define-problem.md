@@ -47,7 +47,7 @@ ls test* 2>/dev/null       # Test directories
 #    Read CLAUDE.md or README.md (first 50 lines) if they exist
 
 # 4. Detect test infrastructure
-#    Look for: vitest.config.ts, jest.config.js, playwright.config.ts, cypress.config.ts
+#    Look for: vitest.config.ts, jest.config.js, cypress.config.ts
 #    Check package.json scripts for test commands
 #
 #    COUNT existing tests (don't just detect framework — count actual test files):
@@ -70,7 +70,7 @@ ls test* 2>/dev/null       # Test directories
 ```
 CODEBASE_CONTEXT = {
   stack: "Next.js 14 + TypeScript + Prisma + PostgreSQL",
-  test_infra: "Vitest (unit) + Playwright (e2e)",
+  test_infra: "Vitest (unit) + agent-browser (e2e)",
   has_auth: true,
   has_db: true,
   has_api: true,
@@ -180,7 +180,7 @@ Map the user's choice to one of these levels. When the user says "match existing
 
 This question adapts based on what test infrastructure exists:
 
-**If robust test infra exists (Vitest + Playwright):**
+**If robust test infra exists (Vitest + agent-browser):**
 ```
 Q3: What level of testing do you want?
 
@@ -196,7 +196,7 @@ Options:
 Which approach?
 ```
 
-**If partial test infra (e.g., Vitest but no Playwright):**
+**If partial test infra (e.g., Vitest but no E2E):**
 ```
 Q3: What level of testing do you want?
 
@@ -382,7 +382,7 @@ criterion is missing (add it). /tickets uses this mapping to validate coverage.
 ### Test Types Required
 - Unit tests: {yes/no — with framework: Vitest/Jest/etc.}
 - Integration tests: {yes/no — with details}
-- E2E browser tests: {yes/no — with framework: Playwright/agent-browser/etc.}
+- E2E browser tests: {yes/no — via agent-browser CLI}
 - Infrastructure setup needed: {yes/no — what needs to be installed}
 
 ### Key Test Scenarios (from user journey)

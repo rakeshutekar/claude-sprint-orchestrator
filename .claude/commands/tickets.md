@@ -116,7 +116,7 @@ BUILD_CMD: "npm run build"
 LINT_CMD: "npm run lint"
 TEST_CMD: "npm run test:run"
 TYPECHECK_CMD: "npx tsc --noEmit"
-E2E_CMD: "npx playwright test"
+E2E_CMD: "agent-browser"
 COMMIT_PREFIX: "feat"                   # Conventional commit prefix (feat, fix, refactor, etc.)
 MAX_PARALLEL_CONTEXT_AGENTS: 4          # Max concurrent Context Agents in Phase 2.5 (1-8, limited by API rate limits)
 MAX_LOOP_ITERATIONS: 3
