@@ -938,6 +938,27 @@ else
 fi
 ```
 
+### Step 0F.8: Verify E2E Tool Availability
+
+If E2E_CMD is configured, verify the tool is installed before reaching Phase 6:
+
+```bash
+if [ -n "${E2E_CMD}" ] && [ "${E2E_CMD}" != "none" ]; then
+  if command -v agent-browser >/dev/null 2>&1; then
+    echo "✅ agent-browser CLI found: $(agent-browser --version 2>/dev/null || echo 'installed')"
+    E2E_AVAILABLE=true
+  else
+    echo "⚠️  agent-browser CLI not found in PATH."
+    echo "   Phase 6 (E2E behavioral verification) will be SKIPPED."
+    echo "   To install: npm install -g agent-browser"
+    echo "   The sprint will still run — E2E is non-blocking."
+    E2E_AVAILABLE=false
+  fi
+else
+  E2E_AVAILABLE=false
+fi
+```
+
 ---
 
 ### Step 0G: Choose Coordination Mode
@@ -2366,14 +2387,23 @@ WORKTREE_DIR=".claude/worktrees/{WORKTREE_NAME}"
 
 # Verify worktree exists
 if [ ! -d "$WORKTREE_DIR" ]; then
-  echo "WORKTREE NOT FOUND at $WORKTREE_DIR — falling back to git diff approach"
-  # Fallback: use git stash/checkout only if worktree was already cleaned
-  git checkout {WORKTREE_BRANCH}
-  FALLBACK_MODE=true
+  echo "WORKTREE NOT FOUND at $WORKTREE_DIR"
+  # SAFETY: Do NOT use git checkout — other parallel verification agents may be running.
+  # Instead, create a temporary worktree for this verification run.
+  TEMP_WORKTREE=".claude/worktrees/verify-{TICKET_ID}-$(date +%s)"
+  git worktree add "$TEMP_WORKTREE" {WORKTREE_BRANCH} 2>/dev/null
+  if [ $? -ne 0 ]; then
+    echo "VERIFICATION ABORT: Cannot create temp worktree for {WORKTREE_BRANCH}"
+    echo "VERIFIED: false"
+    exit 1
+  fi
+  WORKTREE_DIR="$TEMP_WORKTREE"
+  TEMP_WORKTREE_CREATED=true
+  echo "Created temporary verification worktree at $TEMP_WORKTREE"
 fi
 
-# All commands below run in the worktree directory (or fallback branch)
-cd "$WORKTREE_DIR" 2>/dev/null || true
+# All commands below run in the worktree directory
+cd "$WORKTREE_DIR"
 
 # 1. Build
 {BUILD_CMD}
@@ -2413,10 +2443,13 @@ TEST_EXIT=$?
 # 7. Check for debug artifacts
 grep -rn "console.log\|debugger\|TODO.*HACK" {files_changed} || echo "CLEAN"
 
-# Return to main repo root (do NOT git checkout — other agents may be running)
+# Return to main repo root
 cd -
-if [ "$FALLBACK_MODE" = "true" ]; then
-  git checkout {BRANCH_BASE}
+
+# Clean up temporary verification worktree (if created due to missing original)
+if [ "$TEMP_WORKTREE_CREATED" = "true" ]; then
+  git worktree remove "$TEMP_WORKTREE" --force 2>/dev/null
+  echo "Cleaned up temporary verification worktree"
 fi
 ```
 
@@ -2511,7 +2544,7 @@ VERIFICATION_RESULT:
 
 ### Step 3C: Code Review Agent (security + quality)
 
-Only runs AFTER Verification Agent confirms VERIFIED = true.
+Runs IN PARALLEL with the Verification Agent (Layers 2+3 are concurrent — see loop logic below).
 
 ```yaml
 subagent_type: "general-purpose"
@@ -3026,9 +3059,9 @@ while loop_count < MAX_LOOPS:
             }
 
             # Source 1: Worker's progress.txt additions
-            # Diff progress.txt before vs after this ticket's Worker ran.
-            # The Worker appends to the "Codebase Patterns" section — extract new entries.
-            worker_patterns = diff progress.txt entries added since this ticket started
+            # Use the Worker's WORKER_RESULT.learnings_added field — it lists exactly what
+            # patterns the Worker appended to progress.txt. No "before" snapshot needed.
+            worker_patterns = worker_result.learnings_added  # from WORKER_RESULT output
             new_entry.learnings.extend(worker_patterns)
 
             # Source 2: Verification loop error→fix pairs
@@ -3620,6 +3653,13 @@ At any point during Phase 4-5:
 
 ## PHASE 6: E2E TESTING — BEHAVIORAL VERIFICATION (PARALLEL)
 
+```
+if E2E_AVAILABLE == false:
+    LOG: "⏭️  PHASE 6 SKIPPED — agent-browser not installed (detected in Step 0F.8)"
+    LOG: "   Sprint continues without E2E behavioral verification."
+    → Skip to Phase 7
+```
+
 Spawn one E2E testing agent **per ticket**, all in parallel.
 These agents perform **behavioral verification** — they don't just run tests,
 they verify the feature actually works by interacting with the running application.
@@ -3896,6 +3936,68 @@ covered everything from the problem statement. This catches gaps that per-ticket
 verification misses — e.g., two tickets each implement half of a feature but
 neither fully delivers the implied requirement.
 
+### Helper: `extract_nouns_and_key_phrases(text)`
+
+This function is defined here (same algorithm used by /tickets Phase 3):
+
+```
+extract_nouns_and_key_phrases(text):
+    # PURPOSE: Extract 2-4 meaningful keywords/phrases from a success criterion
+    # for matching against ticket titles and descriptions.
+    #
+    # ALGORITHM:
+    # 1. Lowercase the text
+    # 2. Remove common stop words: a, an, the, is, are, was, were, be, been,
+    #    has, have, had, do, does, did, will, shall, should, can, could, may,
+    #    must, with, from, for, and, or, but, in, on, at, to, of, by, as, it,
+    #    its, that, this, when, if, then, than, also, each, every, all, any
+    # 3. Remove common verbs: renders, displays, shows, handles, creates,
+    #    returns, sends, receives, validates, checks, updates, saves, loads
+    # 4. Extract remaining multi-word phrases (2-3 word sequences) as primary keywords
+    #    Example: "notification bell" > "notification" alone
+    # 5. Extract remaining single words (4+ characters) as fallback keywords
+    # 6. Return unique list of 2-4 keywords, preferring multi-word phrases
+    #
+    # EXAMPLES:
+    #   "Notification bell renders in top nav with unread count"
+    #   → ["notification bell", "top nav", "unread count"]
+    #
+    #   "User can mark individual notifications as read"
+    #   → ["mark notifications", "individual notifications", "read"]
+    #
+    #   "API returns paginated notification history"
+    #   → ["paginated notification", "notification history"]
+    #
+    # FALLBACK: If fewer than 2 keywords extracted, split text on spaces
+    # and return the 2-3 longest words (excluding stop words).
+
+    keywords = []
+    cleaned = lowercase(text)
+    cleaned = remove_stop_words(cleaned)
+    cleaned = remove_common_verbs(cleaned)
+
+    # Extract bigrams (2-word phrases) first — more specific matches
+    words = split(cleaned)
+    for i in range(len(words) - 1):
+        bigram = words[i] + " " + words[i+1]
+        if len(words[i]) >= 3 and len(words[i+1]) >= 3:
+            keywords.append(bigram)
+
+    # Add remaining significant single words not already in a bigram
+    for word in words:
+        if len(word) >= 4 and not any(word in k for k in keywords):
+            keywords.append(word)
+
+    # Deduplicate and limit to 2-4 keywords
+    keywords = unique(keywords)[:4]
+
+    # Fallback: if fewer than 2, use longest words from original text
+    if len(keywords) < 2:
+        keywords = sorted(words, key=len, reverse=True)[:3]
+
+    return keywords
+```
+
 ```
 {IF .claude/problem-statement.md exists:
 
@@ -3908,13 +4010,9 @@ neither fully delivers the implied requirement.
   completed_tickets = sprint-state.json → all tickets with status "Done"
   all_commits = gather commit messages from all completed ticket branches
 
-  # 3. Check each success criterion (uses same keyword extraction as /tickets Phase 3)
+  # 3. Check each success criterion
   unmet_criteria = []
   for criterion in success_criteria:
-      # Extract keywords using the same algorithm defined in /tickets:
-      # - Remove stop words and common verbs
-      # - Extract bigrams (2-word phrases) first, then significant single words
-      # - Return 2-4 keywords per criterion
       keywords = extract_nouns_and_key_phrases(criterion)
 
       # Search THREE evidence sources (broadest coverage):
@@ -4407,7 +4505,7 @@ if [ -f .claude/sprint-state.json ]; then
   rm .claude/sprint-state.json
 fi
 
-# 5. Final status
+# 6. Final status
 git worktree list
 echo "Cleanup complete."
 ```
@@ -4436,6 +4534,7 @@ echo "Cleanup complete."
     [ ] Problem statement loaded (if .claude/problem-statement.md exists from /define)
     [ ] User journey steps extracted for Phase 6 E2E scenarios
     [ ] Success criteria extracted for Layer 4 Completion Agent
+    [ ] E2E tool availability checked (agent-browser installed → E2E_AVAILABLE=true/false)
     [ ] Coordination mode chosen (Subagents or Agent Teams)
     [ ] Agent Teams env flag verified (if Agent Teams mode)
     [ ] sprint-state.json initialized with all ticket entries
@@ -4445,7 +4544,7 @@ echo "Cleanup complete."
     [ ] Permission mode selected (auto-approve / skip-all / manual / pre-configured)
     [ ] If auto-approve: allowedTools config displayed, user confirmed
     [ ] If skip-all: --dangerously-skip-permissions flag verified
-    [ ] Permission mode stored in sprint-state.json
+    [ ] Permission mode asked fresh (NOT stored — always re-prompt)
 
 [ ] Phase 1: Tickets fetched, initialized, and sorted
     [ ] Step 1A: {N} tickets loaded from Linear

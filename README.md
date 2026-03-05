@@ -630,9 +630,9 @@ Each agent runs independently. The orchestrator passes all context between them 
 your-project/
 ├── .claude/
 │   ├── commands/
-│   │   ├── define-problem.md                # /define command (~300 lines)
-│   │   ├── orchestrate-parallel-sprint.md   # /sprint command (3600+ lines)
-│   │   └── tickets.md                       # /tickets command (1350+ lines)
+│   │   ├── define-problem.md                # /define command (~600 lines)
+│   │   ├── orchestrate-parallel-sprint.md   # /sprint command (4600+ lines)
+│   │   └── tickets.md                       # /tickets command (1800+ lines)
 │   ├── worktrees/                           # Auto-created, must be in .gitignore
 │   ├── problem-statement.md                 # From /define — intent contract (auto-created)
 │   ├── sprint-state.json                    # Sprint checkpoint (auto-created)
@@ -697,7 +697,7 @@ Plus global agents: Scheduler, Conflict Resolution, Build Gate, Retrospective.
 - **Linear account** — with Linear MCP connected in Claude Code
 - **A buildable project** — with working build, lint, typecheck, and test commands
 - **Git repository** — clean working tree on the base branch
-- **agent-browser** (optional) — Vercel's agent-browser CLI for E2E behavioral verification. If not installed, Phase 6 falls back to E2E_CMD only.
+- **agent-browser** (optional) — Vercel's agent-browser CLI for E2E behavioral verification. If not installed, Phase 6 is skipped (non-blocking). Install: `npm install -g agent-browser`
 
 ---
 
