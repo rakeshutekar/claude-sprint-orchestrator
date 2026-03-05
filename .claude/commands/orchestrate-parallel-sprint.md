@@ -140,15 +140,16 @@ echo ".claude/worktrees/" >> .gitignore && git add .gitignore && git commit -m "
                                 │
                                 ▼
 ┌─────────────────────────────────────────────────────────────────────┐
-│                    PHASE 1: FETCH TICKETS                           │
-│  Query Linear for all tickets matching LINEAR_FILTER                │
-│  Store: [{id, title, description, priority, labels}]                │
+│                    PHASE 1: FETCH & SORT TICKETS                    │
+│  1A: Query Linear for all tickets matching LINEAR_FILTER            │
+│  1B: Initialize per-ticket state objects in sprint-state.json       │
+│  1C: Topological sort into DEPLOYMENT_WAVES (dependency-aware)      │
 └───────────────────────────────┬─────────────────────────────────────┘
                                 │
                     ┌───────────┼───────────┐
                     ▼           ▼           ▼        (one pair per ticket)
 ┌──────────────────────────────────────────────────────────────────┐
-│           PHASE 2: DEPLOY AGENT TEAMS (PARALLEL)                 │
+│       PHASE 2: DEPLOY AGENT TEAMS (WAVE-BASED PARALLEL)          │
 │                                                                  │
 │  ┌──────────────────────────────────────────────────────────┐    │
 │  │  PER TICKET — SHARED WORKTREE (Agent Team)               │    │
@@ -1100,6 +1101,8 @@ cat > .claude/sprint-state.json << 'STATEEOF'
   "safety_tag": "sprint-start-{YYYYMMDD-HHMMSS}",
   "phase": "0-preflight",
   "tickets": {},
+  "deployment_waves": [],
+  "intra_sprint_learnings": [],
   "merge_order": [],
   "dashboard": {
     "started_at": "{ISO_TIMESTAMP}",
@@ -1294,14 +1297,98 @@ Store as `TICKETS[]` array. Log count: "Found {N} tickets to process."
 
 If zero tickets found → STOP. Sprint is already complete.
 
+### Step 1B: Initialize Per-Ticket State Objects
+
+After fetching tickets, immediately populate `sprint-state.json` with per-ticket entries.
+This ensures every downstream phase can safely read/write ticket state without undefined key errors.
+
+```
+for each ticket in TICKETS[]:
+    sprint-state.json.tickets[ticket.id] = {
+        "title": ticket.title,
+        "status": "queued",              # Lifecycle: queued → context → implementing → verifying → done | stuck
+        "wave": ticket.wave,             # Implementation Wave from /tickets plan (1-4), or null if not from /tickets
+        "dependencies": ticket.deps,     # Array of ticket IDs this ticket is blocked by
+        "worktree_branch": null,         # Set in Phase 2 when worktree is created
+        "agent_id": null,                # Set in Phase 2 when Worker Agent returns
+        "loop_count": 0,                 # Verification loop iterations (Phase 3)
+        "last_error": null,              # Most recent verification error (Phase 3)
+        "evidence": null,                # Quality gate evidence from Worker (Phase 3/5)
+        "preflight_ran": false,          # Whether Worker ran all 4 preflight commands
+        "started_at": null,              # ISO timestamp when Phase 2 deployment begins
+        "completed_at": null,            # ISO timestamp when ticket passes verification
+        "merge_sha": null                # Commit SHA after merge to BRANCH_BASE (Phase 4)
+    }
+
+# Update dashboard counters
+sprint-state.json.dashboard.tickets_total = TICKETS[].length
+```
+
+### Step 1C: Sort Tickets into Dependency-Aware Deployment Order
+
+Tickets must be deployed in waves based on their dependency graph. A ticket cannot
+be deployed until all its dependencies are deployed (or at least queued for the same wave).
+
+```
+DEPLOYMENT_WAVES = []
+
+# Build adjacency map: ticket_id → [dependent_ticket_ids]
+dep_graph = {}
+for each ticket in TICKETS[]:
+    dep_graph[ticket.id] = ticket.dependencies or []
+
+# Topological sort into waves
+remaining = set(all ticket IDs)
+while remaining is not empty:
+    # Find tickets whose deps are ALL in previous waves (or have no deps)
+    ready = [t for t in remaining if all(dep NOT in remaining for dep in dep_graph[t])]
+
+    if ready is empty AND remaining is not empty:
+        # Circular dependency detected — STOP
+        echo "❌ CIRCULAR DEPENDENCY: tickets {remaining} are mutually blocked."
+        echo "   Fix in Linear before re-running /sprint."
+        STOP
+
+    DEPLOYMENT_WAVES.append(ready)
+    remaining = remaining - set(ready)
+
+# Log deployment plan
+for i, wave in enumerate(DEPLOYMENT_WAVES):
+    echo "  Wave {i+1}: {wave} (parallel)"
+
+# Store in sprint-state for compaction recovery
+sprint-state.json.deployment_waves = DEPLOYMENT_WAVES
+```
+
 ---
 
 ## PHASE 2: DEPLOY AGENT TEAMS (ALL TICKETS IN PARALLEL)
 
+Deploy tickets using the `DEPLOYMENT_WAVES` computed in Step 1C. Within each wave,
+deploy all tickets **in parallel**. Between waves, wait for the previous wave to complete
+(or at least have its dependencies verified) before starting the next wave.
+
+```
+for wave_index, wave_tickets in enumerate(DEPLOYMENT_WAVES):
+    LOG: "Deploying Wave {wave_index + 1}: {len(wave_tickets)} tickets in parallel"
+
+    # Update sprint-state.json phase
+    sprint-state.json.phase = "2-implementation"
+    sprint-state.json.dashboard.current_phase = "2-implementation"
+
+    # Deploy all tickets in this wave simultaneously
+    parallel for each ticket in wave_tickets:
+        deploy_agent_team(ticket)   # See Step 2A below
+
+    # Wait for all wave tickets to either complete or get stuck
+    # before proceeding to next wave (deps might be needed)
+    if wave_index < len(DEPLOYMENT_WAVES) - 1:
+        LOG: "Wave {wave_index + 1} complete. Proceeding to Wave {wave_index + 2}."
+```
+
 For each ticket, deploy an **Agent Team** where the orchestrator is team lead and spawns
 a Context Agent (Sonnet) + Worker Agent (Opus) as teammates in the same worktree. Both
-agents are alive simultaneously and can message each other directly. All ticket teams
-run **in parallel** across tickets.
+agents are alive simultaneously and can message each other directly.
 
 If `COORDINATION_MODE == "subagents"`, fall back to the sequential mode: Context Agent
 runs first, returns text, dies, then Worker Agent is spawned with that text pasted into
@@ -1382,11 +1469,33 @@ TIMEOUT RULES FOR AGENT TEAMS:
 
 If subagents mode is selected, Phase 2 reverts to sequential handoff:
 1. Context Agent (Sonnet) runs in a worktree, reads codebase, returns text, worktree auto-cleaned
-2. Orchestrator pastes Context Agent output into Worker Agent prompt
+2. Orchestrator STRUCTURES the Context Agent's output into the handoff format (see Worker prompt
+   "Codebase Context (from Context Agent — static handoff)" section), then pastes into Worker prompt
 3. Worker Agent (Opus) runs in a NEW worktree, implements, commits, worktree preserved
 The Worker cannot ask follow-up questions. Context transfer is one-way and lossy.
 
+**Subagent Context Agent Prompt:** Use the SAME prompt as the Agent Teams Context Agent Teammate
+prompt above, with these modifications:
+- Remove "STAY ALIVE" instructions (it won't stay alive)
+- Remove "Follow-Up Questions" section
+- ADD: "Include ALL starter template source code in your text output (your worktree will be cleaned)"
+- ADD: "Structure your output with clear headings: Files Analyzed, Patterns, Types, Starter Templates,
+  Edge Cases, Unverified — the orchestrator will paste these sections into the Worker prompt."
+
 ### Step 2A: Deploy Agent Team (per ticket)
+
+Before deploying each ticket, update its state:
+```
+sprint-state.json.tickets[{TICKET_ID}].status = "context"
+sprint-state.json.tickets[{TICKET_ID}].started_at = "{ISO_TIMESTAMP}"
+```
+
+After the Worker returns (whether success or failure), update:
+```
+sprint-state.json.tickets[{TICKET_ID}].worktree_branch = "{returned_branch_name}"
+sprint-state.json.tickets[{TICKET_ID}].agent_id = "{returned_agent_id}"
+sprint-state.json.tickets[{TICKET_ID}].status = "implementing"
+```
 
 **Smart Worktree Strategy (Dependency-Aware Branching):**
 
@@ -1428,10 +1537,11 @@ for each ticket in deployment order:
         execute POST_CREATE
         cd -
 
-DEPLOYMENT ORDER:
+DEPLOYMENT ORDER (computed in Step 1C — stored in sprint-state.json.deployment_waves):
   Wave 1 tickets (no deps) → deploy first, all in parallel
   Wave 2 tickets (depend on Wave 1) → deploy after Wave 1 completes
   Within a wave, independent tickets deploy in parallel
+  Circular dependencies detected in Step 1C → sprint STOPS before Phase 2
 ```
 
 **Agent Teams Mode (default):**
@@ -1459,6 +1569,18 @@ You are part of an Agent Team with a Worker Agent. You can message each other di
 You are the CODEBASE EXPERT. Your job is to:
 1. Research the codebase thoroughly BEFORE the Worker starts implementing
 2. STAY ALIVE to answer the Worker's follow-up questions in real-time
+
+## Problem Statement Constraints (from /define)
+{IF PROBLEM_STATEMENT is not null:
+  ### Hard Constraints
+  {extract_section("Constraints")}
+  → Flag ANY codebase patterns that would violate these constraints.
+
+  ### Testing Level: {TESTING_LEVEL}
+  → Adjust how many test patterns and edge cases you extract:
+    Full = exhaustive, Standard = happy+error, Minimal = core only
+}
+{IF PROBLEM_STATEMENT is null: "No constraints from /define — analyze broadly."}
 
 ## Initial Research (do this immediately)
 Research the codebase and share your findings with the Worker:
@@ -1699,10 +1821,47 @@ should match the pattern for "Edge Cases". Never require exact string equality.
   30 seconds reading a file yourself is cheaper than re-running the verification loop.
 }
 {IF COORDINATION_MODE == "subagents":
-  ## Codebase Context (from Context Agent)
-  {PASTE FULL CONTEXT AGENT OUTPUT HERE}
-  Note: The Context Agent is no longer alive. You cannot ask follow-up questions.
-  If you need information not covered above, you must read the files yourself.
+  ## Codebase Context (from Context Agent — static handoff)
+
+  The Context Agent has completed its analysis and is no longer alive.
+  You CANNOT ask follow-up questions. If you need information not covered below,
+  you MUST read the files yourself.
+
+  ### Handoff Protocol (orchestrator assembles this section):
+  The orchestrator takes the Context Agent's returned text output and structures it
+  into these sub-sections. If the Context Agent didn't produce a section, mark it "[NOT PROVIDED]".
+
+  ### Files Analyzed
+  {PASTE Context Agent's file analysis — function signatures, line counts, exports.
+   This is the most critical section. If the Context Agent returned EVIDENCE FORMAT
+   blocks, paste them verbatim here. The Worker needs exact signatures.}
+
+  ### Patterns Discovered
+  {PASTE Context Agent's pattern findings — import conventions, error handling style,
+   test patterns. Include file:line references.}
+
+  ### Types & Schemas
+  {PASTE Context Agent's TYPE ANALYSIS FORMAT blocks — full interface definitions
+   with field descriptions and nullable annotations.}
+
+  ### Starter Templates
+  {IF the Context Agent generated starter template files (written to its worktree):
+    NOTE: In subagent mode, the Context Agent's worktree is AUTO-CLEANED (read-only).
+    The starter templates it wrote are GONE. However, the Context Agent should have
+    included the template source code in its text output. PASTE those templates here
+    so the Worker can recreate them.
+
+    If the Context Agent did NOT include template source in its output:
+    "[Templates not available — Context Agent worktree was cleaned. Worker must
+     create files from scratch using the function signatures and patterns above.]"
+  }
+
+  ### Suggested Edge Cases
+  {PASTE Context Agent's edge case suggestions — these supplement the ticket's own edge cases.}
+
+  ### Unverified References
+  {PASTE any [UNVERIFIED] items the Context Agent flagged. The Worker should verify
+   these by reading the files directly before relying on them.}
 }
 
 ## Accumulated Learnings (from progress.txt)
@@ -2819,6 +2978,46 @@ while loop_count < MAX_LOOPS:
         update sprint-state.json: tickets[{TICKET_ID}].evidence_comment_verified = true
         update sprint-dashboard.md (if SPRINT_DASHBOARD enabled)
         LOG: "TICKET {TICKET_ID} PROVEN COMPLETE — orchestrator posted evidence ✓, status Done ✓"
+
+        # ─── INTRA_SPRINT_LEARNINGS EXTRACTION (triggered on Layer 5.5 PASS) ───
+        # Now that this ticket is proven complete, extract learnings for future Workers.
+        # This is the ONLY trigger point for learning extraction — it runs once per completed ticket.
+        extract_learnings_for_ticket({TICKET_ID}):
+            new_entry = {
+                "ticket_id": "{TICKET_ID}",
+                "timestamp": "{ISO_TIMESTAMP}",
+                "learnings": [],
+                "error_resolved": null
+            }
+
+            # Source 1: Worker's progress.txt additions
+            # Diff progress.txt before vs after this ticket's Worker ran.
+            # The Worker appends to the "Codebase Patterns" section — extract new entries.
+            worker_patterns = diff progress.txt entries added since this ticket started
+            new_entry.learnings.extend(worker_patterns)
+
+            # Source 2: Verification loop error→fix pairs
+            # If this ticket looped (loop_count > 1), the error type + fix is valuable.
+            if sprint-state.json.tickets[{TICKET_ID}].loop_count > 1:
+                new_entry.error_resolved = {
+                    "type": sprint-state.json.tickets[{TICKET_ID}].last_error.type,
+                    "pattern": sprint-state.json.tickets[{TICKET_ID}].last_error.message,
+                    "fix": "Resolved after {loop_count} iterations — " +
+                           "check Worker's final commit message for fix details",
+                    "loop_count": sprint-state.json.tickets[{TICKET_ID}].loop_count
+                }
+
+            # Source 3: Worker's WORKER_RESULT notes (if any contain reusable insights)
+            # Look for patterns like "discovered that..." or "had to..." in worker output
+            if worker_result contains reusable_insights:
+                new_entry.learnings.extend(reusable_insights)
+
+            # Persist to buffer and progress.txt
+            INTRA_SPRINT_LEARNINGS.append(new_entry)
+            sprint-state.json.intra_sprint_learnings = INTRA_SPRINT_LEARNINGS
+            append new_entry.learnings to progress.txt "Codebase Patterns" section
+            LOG: "Extracted {len(new_entry.learnings)} learnings + {1 if error_resolved else 0} error pattern from {TICKET_ID}"
+
         break
 
     else:
@@ -3174,10 +3373,14 @@ fi
 # 6. If build fails → rollback and spawn fix agent
 # git reset --hard pre-merge-{TICKET_ID}
 
-# 7. On successful merge → clean up the worktree
+# 7. On successful merge → record SHA, update state, clean up worktree
+MERGE_SHA=$(git rev-parse HEAD)
+sprint-state.json.tickets[{TICKET_ID}].merge_sha = MERGE_SHA
+sprint-state.json.tickets[{TICKET_ID}].completed_at = "{ISO_TIMESTAMP}"
+sprint-state.json.merge_order.append({TICKET_ID})
 git worktree remove .claude/worktrees/{name} --force
 git branch -d worktree-{name}
-echo "Merged and cleaned: {TICKET_ID} (worktree-{name})"
+echo "Merged and cleaned: {TICKET_ID} (worktree-{name}) → SHA: ${MERGE_SHA:0:7}"
 ```
 
 **Worktree Cleanup Strategy:**
@@ -3670,26 +3873,77 @@ neither fully delivers the implied requirement.
   completed_tickets = sprint-state.json → all tickets with status "Done"
   all_commits = gather commit messages from all completed ticket branches
 
-  # 3. Check each success criterion
+  # 3. Check each success criterion (uses same keyword extraction as /tickets Phase 3)
   unmet_criteria = []
   for criterion in success_criteria:
-      # Search completed ticket descriptions + commit messages for evidence
-      evidence = grep -i "{criterion_keywords}" across ticket descriptions + commits
-      if no evidence found:
-          unmet_criteria.append(criterion)
+      # Extract keywords using the same algorithm defined in /tickets:
+      # - Remove stop words and common verbs
+      # - Extract bigrams (2-word phrases) first, then significant single words
+      # - Return 2-4 keywords per criterion
+      keywords = extract_nouns_and_key_phrases(criterion)
 
-  # 4. Check each implied feature
+      # Search THREE evidence sources (broadest coverage):
+      # Source A: Completed ticket titles + descriptions (from Linear)
+      # Source B: Commit messages from all completed ticket branches
+      # Source C: Actual code changes — grep keywords in `git diff {BRANCH_BASE}...HEAD`
+      matched_sources = []
+      for source in [ticket_descriptions, commit_messages, code_diff]:
+          for keyword in keywords:
+              if keyword found (case-insensitive) in source:
+                  matched_sources.append(source_name)
+                  break  # One keyword match per source is enough
+
+      if len(matched_sources) == 0:
+          unmet_criteria.append({
+              "criterion": criterion,
+              "keywords_searched": keywords,
+              "severity": "HIGH"  # No evidence anywhere
+          })
+      elif len(matched_sources) == 1 and matched_sources[0] == "code_diff":
+          # Code exists but no ticket explicitly claims it — possible accidental coverage
+          unmet_criteria.append({
+              "criterion": criterion,
+              "keywords_searched": keywords,
+              "severity": "LOW",  # Code exists, might just be missing docs
+              "note": "Code changes match but no ticket description claims this criterion"
+          })
+
+  # 4. Check each implied feature (more specific — use substring matching)
   undelivered_features = []
   for feature in implied_features:
-      evidence = grep -i "{feature_keywords}" across ticket descriptions + commits
-      if no evidence found:
-          undelivered_features.append(feature)
+      # Implied features are specific (e.g., "Mark-as-read mutation")
+      # Use direct substring search across ticket titles (case-insensitive)
+      feature_words = [w for w in feature.split() if len(w) >= 3]
+      matched = false
+      for ticket in completed_tickets:
+          ticket_text = ticket.title + " " + ticket.description
+          match_count = sum(1 for w in feature_words if w.lower() in ticket_text.lower())
+          if match_count >= max(1, len(feature_words) // 2):  # At least half the words match
+              matched = true
+              break
+      if not matched:
+          # Fallback: check code diff for the feature name
+          if feature.lower() not in code_diff.lower():
+              undelivered_features.append(feature)
 
   # 5. Verify user journey step coverage
   uncovered_steps = []
   for step in user_journey:
-      # Check if any ticket's acceptance criteria cover this step
-      if no ticket covers this step:
+      # Parse each step into an action verb + object (e.g., "User clicks bell icon" → "clicks bell icon")
+      step_keywords = extract_nouns_and_key_phrases(step)
+
+      # Check if any completed ticket's acceptance criteria mention this step
+      step_covered = false
+      for ticket in completed_tickets:
+          for ac in ticket.acceptance_criteria:
+              for keyword in step_keywords:
+                  if keyword.lower() in ac.lower():
+                      step_covered = true
+                      break
+              if step_covered: break
+          if step_covered: break
+
+      if not step_covered:
           uncovered_steps.append(step)
 
   # 6. Report and act
@@ -3705,7 +3959,28 @@ neither fully delivers the implied requirement.
       echo "  [3] Manual review — I'll check these myself"
 
       # If user chooses [1]:
-      # Create tickets with label "sprint-followup" and reference the problem statement
+      for gap in (unmet_criteria + undelivered_features + uncovered_steps):
+          ORCHESTRATOR creates Linear issue:
+              team: {LINEAR_FILTER.team}
+              title: "[Follow-up] {gap description or criterion text, truncated to 80 chars}"
+              label: "sprint-followup"
+              priority: 3 (medium)
+              description: |
+                  ## Gap Source
+                  This ticket was auto-created by /sprint Phase 7.5 completeness check.
+
+                  ## Original Requirement
+                  {full text of the criterion/feature/step}
+
+                  ## Evidence Searched
+                  Keywords: {keywords searched}
+                  Sources checked: ticket descriptions, commit messages, code diff
+                  Match result: {severity or "no match"}
+
+                  ## Problem Statement Reference
+                  See .claude/problem-statement.md → section: {relevant section name}
+          LOG: "Created follow-up ticket for gap: {gap}"
+      echo "Created {N} follow-up tickets with label 'sprint-followup'"
   else:
       echo "✅ All success criteria, implied features, and user journey steps covered."
   fi
@@ -3991,6 +4266,11 @@ The orchestrator itself follows these principles:
 33. **Smart worktrees respect dependencies.** When Ticket B depends on Ticket A, B's worktree should include A's code. Deploy tickets in wave order. Within a wave, parallelize. Between waves, ensure prior wave's code is available (merged to base or pre-merged into worktree).
 34. **Failure patterns persist across sprints.** The `.claude/failure-patterns.json` database accumulates error → resolution mappings. High-frequency patterns (3+ occurrences) are injected into Worker prompts as pre-warnings. The retrospective agent updates this database after every sprint.
 35. **Monitor your own health.** The orchestrator checks its context usage after every ticket completion. At >70%, it writes ALL critical state to durable storage (sprint-state.json, progress.txt, dashboard). Watch for degradation signals: forgetting ticket states, losing agent_ids, dropping learnings. Reload from disk if degraded.
+36. **Initialize ticket state before deployment.** Step 1B populates per-ticket objects in sprint-state.json immediately after fetching tickets. Never write to a ticket key that wasn't initialized.
+37. **Deploy in wave order.** Step 1C computes DEPLOYMENT_WAVES via topological sort. Phase 2 deploys Wave 1 first (all parallel), then Wave 2 after Wave 1 completes, etc. Circular dependencies STOP the sprint before Phase 2.
+38. **Structure subagent handoffs.** In subagent mode, the orchestrator structures Context Agent output into defined sections (Files, Patterns, Types, Templates, Edge Cases, Unverified) before pasting into the Worker prompt. The Worker receives organized context, not a raw text dump.
+39. **Run Phase 7.5 completeness check.** After all tickets complete, verify the sprint covered every success criterion, implied feature, and user journey step from the problem statement. Use extract_nouns_and_key_phrases() for keyword matching across three evidence sources.
+40. **Track merge SHAs.** After each successful merge in Phase 4, record the merge commit SHA and completed_at timestamp in sprint-state.json. This enables rollback to any specific ticket merge point.
 
 ---
 
@@ -4132,9 +4412,14 @@ echo "Cleanup complete."
     [ ] If skip-all: --dangerously-skip-permissions flag verified
     [ ] Permission mode stored in sprint-state.json
 
-[ ] Phase 1: Tickets fetched
-    [ ] {N} tickets loaded from Linear
-    [ ] sprint-state.json updated (phase: "tickets_loaded")
+[ ] Phase 1: Tickets fetched, initialized, and sorted
+    [ ] Step 1A: {N} tickets loaded from Linear
+    [ ] Step 1B: Per-ticket state objects initialized in sprint-state.json
+    [ ] Step 1B: Each ticket has: status, wave, dependencies, worktree_branch, agent_id, etc.
+    [ ] Step 1C: DEPLOYMENT_WAVES computed via topological sort
+    [ ] Step 1C: No circular dependencies detected (or resolved)
+    [ ] sprint-state.json.deployment_waves populated
+    [ ] sprint-state.json updated (phase: "1-context")
 
 [ ] Phase 2: Agent pairs deployed
     [ ] Smart worktree strategy: dependent tickets branch from dep's merged code
@@ -4145,9 +4430,13 @@ echo "Cleanup complete."
     [ ] All worker branch names and agent_ids stored
     [ ] All worker evidence blocks use EXACT format (no fabricated output)
     [ ] Workers received enriched ticket context (edge cases, file context, contracts, test patterns)
+    [ ] If subagent mode: Context Agent output structured into handoff sections (Files, Patterns, Types, Templates, Edge Cases)
+    [ ] If subagent mode: Starter templates included in handoff text (worktree auto-cleaned)
+    [ ] Context Agents received problem statement constraints and testing level
     [ ] Workers received sprint-local learnings buffer (cross-ticket knowledge)
     [ ] Workers received high-frequency failure pattern warnings (if any matched)
-    [ ] sprint-state.json updated per ticket (phase: "implementation")
+    [ ] sprint-state.json per-ticket status transitions: queued → context → implementing
+    [ ] sprint-state.json per-ticket: started_at, worktree_branch, agent_id set
 
 [ ] Phase 2.5: Code Simplifier (conditional)
     [ ] Simplifier skip/run decision logged (Agent Teams + clean → skip; subagents/5+ files → run)
@@ -4175,7 +4464,9 @@ echo "Cleanup complete."
     [ ] Zero evidence mismatches detected across all tickets
     [ ] Circuit breaker: No ticket exceeded 2x same-error (or escalated to fresh agent)
     [ ] sprint-state.json updated per ticket (loop_count, status, last_error if any)
-    [ ] INTRA_SPRINT_LEARNINGS buffer updated after each ticket completion
+    [ ] INTRA_SPRINT_LEARNINGS extraction ran after each Layer 5.5 PASS
+    [ ] Learnings extracted from: progress.txt diffs, verification loop errors, Worker notes
+    [ ] INTRA_SPRINT_LEARNINGS persisted to sprint-state.json.intra_sprint_learnings
     [ ] Orchestrator self-health: context checked after every ticket (>70% → strategic compaction)
     [ ] Orchestrator self-health: all state written to durable storage if >70%
     [ ] Orchestrator self-health: no degradation signals detected (or state reloaded from disk)
@@ -4202,6 +4493,8 @@ echo "Cleanup complete."
     [ ] Dependency drift: npm install ran after each ticket with package.json changes
     [ ] Post-merge conflict verification passed (Step 4D — both tickets' tests pass)
     [ ] Merged worktrees cleaned up
+    [ ] sprint-state.json per-ticket: merge_sha and completed_at recorded
+    [ ] sprint-state.json.merge_order populated in actual merge sequence
     [ ] Sprint dashboard updated with merge progress
 
 [ ] Phase 5: Build gate
@@ -4224,8 +4517,20 @@ echo "Cleanup complete."
     [ ] Failure tickets created on Linear with evidence (if any)
 
 [ ] Phase 7: Remaining ticket check
+    [ ] PHASE7_STATUSES computed (deduplicated LINEAR_FILTER.status + ["Todo"])
     [ ] No tickets remain (or safety cap reached)
     [ ] Fix-up loop iterations: {N}/{MAX_LOOP_ITERATIONS}
+
+[ ] Phase 7.5: Cross-ticket feature completeness check
+    [ ] Problem statement loaded (or skipped if absent)
+    [ ] Success criteria checked via extract_nouns_and_key_phrases() keyword matching
+    [ ] Three evidence sources searched: ticket descriptions, commit messages, code diff
+    [ ] Implied features checked via substring matching
+    [ ] User journey step coverage verified against acceptance criteria
+    [ ] Gaps reported with severity (HIGH = no evidence, LOW = code but no ticket claim)
+    [ ] If gaps found: user chose [create follow-ups / ignore / manual review]
+    [ ] Follow-up tickets created with "sprint-followup" label (if chosen)
+    [ ] sprint-state.json updated: current_phase = "7.5-completeness"
 
 [ ] Phase 8: Post-Sprint Learning Loop
     [ ] Retrospective Agent analyzed sprint-state.json + dashboard + progress.txt

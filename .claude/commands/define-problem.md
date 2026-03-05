@@ -141,12 +141,42 @@ for the entire sprint.
 
 **After user answers Q2**, extract:
 - Discrete user journey steps (these become E2E test scenarios)
-- Implied features (e.g., "bell icon with count" implies a counter, a badge component, a fetch endpoint)
 - Any ambiguity to clarify in follow-ups
+- **Implied features** — derived by decomposing each user journey step:
+
+```
+EXTRACTION RULE: For each user journey step, identify what must EXIST for it to work.
+
+Example: "User sees a bell icon with unread count"
+  → UI component: NotificationBell (renders icon + badge)
+  → API endpoint: GET /api/notifications/count (returns unread count)
+  → Data layer: notifications table or equivalent with is_read flag
+  → Real-time: WebSocket or polling to update count without refresh
+
+Example: "User clicks bell, sees recent notifications"
+  → UI component: NotificationDropdown (lists recent items)
+  → API endpoint: GET /api/notifications?limit=10 (paginated list)
+  → Data model: Notification { id, userId, message, createdAt, isRead }
+
+STOP extracting at the feature boundary — do NOT design implementation.
+"Mark-as-read mutation" is good. "PATCH /api/notifications/:id with Prisma
+ update call" is too detailed — that's /tickets' job.
+```
 
 ---
 
 ### Q3: Testing Strategy (ALWAYS ASK — context-aware)
+
+**Testing Level Definitions** (used to interpret user's choice):
+
+| Level | Unit Tests | Integration Tests | E2E Browser Tests | Coverage Target |
+|-------|-----------|------------------|-------------------|----------------|
+| **Minimal** | Core logic only (happy path + 1-2 critical edge cases) | None | None | >50% new code |
+| **Standard** | All public functions, happy + error paths | API endpoints, DB operations | Critical path only (1-2 scenarios) | >80% new code |
+| **Full** | All functions including helpers, boundary cases | All API endpoints, DB ops, service interactions | All user journey steps from Q2 | >90% new code |
+| **Custom** | User specifies | User specifies | User specifies | User specifies |
+
+Map the user's choice to one of these levels. When the user says "match existing patterns" → **Standard**. When they say "full coverage" → **Full**.
 
 This question adapts based on what test infrastructure exists:
 
@@ -222,10 +252,35 @@ If none, just say "none" and we'll move on.
 
 ### CONDITIONAL FOLLOW-UPS (0-3 additional questions based on context)
 
-These are asked ONLY if relevant. The orchestrator decides based on CODEBASE_CONTEXT
-and previous answers.
+These are asked ONLY if relevant. Use these decision trees — not subjective judgment:
 
-**Q5: Database Changes (ask if CODEBASE_CONTEXT.has_db AND feature implies new data)**
+```
+Q5 DECISION TREE (Database Changes):
+  ASK if: CODEBASE_CONTEXT.has_db == true
+    AND (user journey mentions storing/creating/saving data
+         OR implied features include new data entities
+         OR Q1 mentions new content types like "notifications", "tasks", "messages")
+  SKIP if: CODEBASE_CONTEXT.has_db == false
+    OR feature is purely UI/cosmetic (restyling, layout changes)
+    OR user explicitly said "no backend changes"
+
+Q6 DECISION TREE (Auth/Permissions):
+  ASK if: CODEBASE_CONTEXT.has_auth == true
+    AND (user journey has role-specific steps like "admin sees...", "only managers can..."
+         OR feature creates user-specific data like "my notifications", "my tasks"
+         OR Q4 constraints mention access control or permissions)
+  SKIP if: CODEBASE_CONTEXT.has_auth == false
+    OR feature is system-wide (affects all users equally, no per-user state)
+    OR feature is read-only public content
+
+Q7 DECISION TREE (External Integrations):
+  ASK if: user journey or Q1/Q4 explicitly mentions a third-party service
+    OR implied features include: email, SMS, payment, webhook, OAuth, file upload to cloud
+  SKIP if: no external service mentioned in any answer so far
+    OR feature is entirely self-contained within the codebase
+```
+
+**Q5: Database Changes** (ask per decision tree above)
 ```
 Q5: This feature sounds like it needs new data storage.
 
@@ -300,12 +355,16 @@ Codebase: {CODEBASE_CONTEXT.stack}
 ...
 
 ### Success Criteria
-{Derived from the user journey — specific, testable statements}
+{Derived from the user journey — each criterion maps to one or more journey steps}
 
-- [ ] {Criterion 1 — e.g., "Notification bell renders in top nav with unread count"}
-- [ ] {Criterion 2 — e.g., "Clicking bell opens dropdown with recent notifications"}
-- [ ] {Criterion 3 — ...}
+- [ ] {Criterion 1 — e.g., "Notification bell renders in top nav with unread count"} ← step 1, 2
+- [ ] {Criterion 2 — e.g., "Clicking bell opens dropdown with recent notifications"} ← step 3
+- [ ] {Criterion 3 — ...} ← step N
 ...
+
+MAPPING RULE: Every user journey step MUST have at least one success criterion.
+If a step has no criterion, either the step is too granular (merge it) or a
+criterion is missing (add it). /tickets uses this mapping to validate coverage.
 
 ### Implied Features
 {Features implied by the user journey that may need explicit tickets}
@@ -361,7 +420,11 @@ Codebase: {CODEBASE_CONTEXT.stack}
 
 ## Codebase Snapshot
 
-{From Phase 0 recon — saved so /tickets can skip re-discovering basics}
+{Phase 0 recon results serialized here. This serves two purposes:
+ 1. /tickets' Explore Agent SKIPS basic stack detection (language, framework, deps,
+    directory structure) and goes DEEPER into architecture patterns instead.
+ 2. /sprint's Context Agents use this as a fast-start reference.
+ This section is the SINGLE SOURCE OF TRUTH for "what does this codebase look like."}
 
 - Stack: {CODEBASE_CONTEXT.stack}
 - Test infrastructure: {CODEBASE_CONTEXT.test_infra}
@@ -484,7 +547,11 @@ RULE 7: GITIGNORE THE PROBLEM STATEMENT
 - Problem description → becomes the FEATURE context (richer than a one-liner)
 - Success criteria → validates that all criteria have at least one ticket covering them
 - Testing strategy → configures test expectations per ticket
-- Implied features → cross-checks against generated ticket list
+- Implied features → cross-checked against generated ticket list:
+  - If a ticket covers an implied feature → logged as "✓ covered"
+  - If an implied feature has NO ticket → flagged as "⚠️ UNCOVERED" in approval gate
+  - If /tickets generates a ticket NOT in the implied features list → noted as "discovery"
+  - User reviews coverage gaps before approving the ticket plan
 - Codebase snapshot → skips re-discovering stack/test infra basics
 - Constraints → passed to Context Agents as "hard constraints"
 
@@ -502,26 +569,32 @@ RULE 7: GITIGNORE THE PROBLEM STATEMENT
 [ ] Phase 0: Quick codebase recon
     [ ] Stack detected (language, framework, key deps)
     [ ] Directory structure scanned
-    [ ] Test infrastructure identified
+    [ ] Test infrastructure identified (framework + test file count)
     [ ] Database/auth/API presence detected
-    [ ] CODEBASE_CONTEXT populated
+    [ ] CODEBASE_CONTEXT populated (all fields non-empty)
 
 [ ] Phase 1: Structured dialogue
-    [ ] Q1: Problem statement captured
-    [ ] Q2: Definition of done / user journey captured
-    [ ] Q3: Testing strategy chosen (context-aware)
-    [ ] Q4: Constraints captured
-    [ ] Q5-Q7: Conditional follow-ups asked (if relevant)
+    [ ] Q1: Problem statement captured (who, current state, desired state)
+    [ ] Q2: Definition of done / user journey captured (numbered steps)
+    [ ] Implied features extracted from user journey (extraction rule applied)
+    [ ] Q3: Testing strategy chosen (mapped to Minimal/Standard/Full/Custom)
+    [ ] Q4: Constraints captured (or explicitly "none")
+    [ ] Q5-Q7: Decision trees evaluated (each: asked OR explicitly skipped with reason)
 
 [ ] Phase 2: Problem statement generated
     [ ] .claude/problem-statement.md written
-    [ ] .claude/problem-statement.md added to .gitignore
-    [ ] All sections populated
-    [ ] User journey → success criteria mapping complete
+    [ ] schema_version: 2 header present (with generated_at, generated_commit)
+    [ ] .gitignore updated (verified: grep -q "problem-statement.md" .gitignore)
+    [ ] All required sections populated: Problem, Definition of Done, Testing Strategy, Constraints
+    [ ] User journey → success criteria mapping complete (every step has ≥1 criterion)
     [ ] User journey → test scenarios mapping complete
+    [ ] Codebase snapshot matches Phase 0 CODEBASE_CONTEXT
 
-[ ] Phase 3: User confirmation
-    [ ] Summary presented to user
-    [ ] User chose: proceed to /tickets / edit / save and stop
-    [ ] If proceed: /tickets invocation displayed
+[ ] Phase 3: User confirmation and handoff
+    [ ] Summary presented to user (not full markdown dump)
+    [ ] User validated answers are correct
+    [ ] User chose one option: [1] proceed / [2] edit / [3] save and stop
+    [ ] If [2]: re-asked question, regenerated problem statement, re-confirmed
+    [ ] If [1]: /tickets copy-paste command displayed
+    [ ] Problem statement is self-contained (readable without conversation context)
 ```

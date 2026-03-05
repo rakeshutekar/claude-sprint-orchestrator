@@ -118,6 +118,7 @@ TEST_CMD: "npm run test:run"
 TYPECHECK_CMD: "npx tsc --noEmit"
 E2E_CMD: "npx playwright test"
 COMMIT_PREFIX: "feat"                   # Conventional commit prefix (feat, fix, refactor, etc.)
+MAX_PARALLEL_CONTEXT_AGENTS: 4          # Max concurrent Context Agents in Phase 2.5 (1-8, limited by API rate limits)
 MAX_LOOP_ITERATIONS: 3
 HUMAN_IN_LOOP: false                    # true = pause for human review before marking Done
 PARTIAL_MERGE: true                     # true = merge completed tickets even if some are stuck
@@ -249,20 +250,60 @@ To extract sections from the markdown problem statement, use this heading-based 
 
 extract_section() {
     local heading="$1"
-    local file=".claude/problem-statement.md"
-    # Case-insensitive match on heading, capture until next heading of same or higher level
-    awk -v heading="$heading" '
-        BEGIN { IGNORECASE=1; found=0; level=0 }
-        /^##/ {
-            if (found) { exit }
-            if (index(tolower($0), tolower(heading)) > 0) {
-                found=1
-                level=gsub(/#/, "#", $1)
+    local file="${2:-.claude/problem-statement.md}"  # Accepts optional file path argument
+
+    # ROBUSTNESS: This parser handles:
+    #   1. Code fences — headings inside ``` blocks are ignored (not treated as section boundaries)
+    #   2. Missing sections — returns empty string + exit code 1 if heading not found
+    #   3. Body text matching — only matches headings at line start (^## ), not heading text in paragraphs
+    #   4. Heading level awareness — stops at same or higher level heading (## stops at ## or #, not ###)
+
+    local result
+    result=$(awk -v heading="$heading" '
+        BEGIN { IGNORECASE=1; found=0; level=0; in_fence=0 }
+
+        # Track code fences — toggle on/off when we see ``` at line start
+        /^```/ { in_fence = !in_fence; if (found) print; next }
+
+        # Inside a code fence, pass through without checking for headings
+        in_fence { if (found) print; next }
+
+        # Only match headings at LINE START: must begin with ## (not in body text)
+        /^#{1,6} / {
+            # Count the heading level (number of # characters)
+            match($0, /^#+/)
+            current_level = RLENGTH
+
+            if (found) {
+                # Stop if we hit a heading at the SAME or HIGHER level (≤ our level number)
+                if (current_level <= level) { exit }
+                # Sub-headings (deeper level) are part of this section — include them
+                print
+                next
+            }
+
+            # Check if this heading matches our target (case-insensitive substring match on heading TEXT only)
+            # Strip the leading #s and whitespace to get just the heading text
+            heading_text = $0
+            sub(/^#+[[:space:]]*/, "", heading_text)
+            if (index(tolower(heading_text), tolower(heading)) > 0) {
+                found = 1
+                level = current_level
                 next
             }
         }
+
         found { print }
-    ' "$file"
+
+        END { if (!found) exit 1 }
+    ' "$file")
+
+    local exit_code=$?
+    if [ $exit_code -ne 0 ]; then
+        echo ""  # Return empty string for missing sections
+        return 1  # Caller can check: if ! section=$(extract_section "Foo"); then echo "missing"; fi
+    fi
+    echo "$result"
 }
 
 # Example usage throughout /tickets:
@@ -273,6 +314,15 @@ extract_section() {
 # TESTING_STRATEGY=$(extract_section "Testing Strategy")
 # CONSTRAINTS=$(extract_section "Constraints")
 # CODEBASE_SNAPSHOT=$(extract_section "Codebase Snapshot")
+#
+# Handling missing sections (returns empty string + exit code 1):
+# if ! CONSTRAINTS=$(extract_section "Constraints"); then
+#     echo "No Constraints section found — proceeding without constraints"
+#     CONSTRAINTS=""
+# fi
+#
+# Custom file path (default is .claude/problem-statement.md):
+# SECTION=$(extract_section "Overview" ".claude/plans/my-plan.md")
 ```
 
 ### Step 0A: Check Linear MCP
@@ -321,6 +371,7 @@ git check-ignore -q .claude/worktrees/ 2>/dev/null || echo ".claude/worktrees/" 
 git check-ignore -q .claude/sprint-dashboard.md 2>/dev/null || echo ".claude/sprint-dashboard.md" >> .gitignore
 git check-ignore -q .claude/sprint-state.json 2>/dev/null || echo ".claude/sprint-state.json" >> .gitignore
 git check-ignore -q .claude/problem-statement.md 2>/dev/null || echo ".claude/problem-statement.md" >> .gitignore
+git check-ignore -q .claude/sprint-hints.json 2>/dev/null || echo ".claude/sprint-hints.json" >> .gitignore
 ```
 
 ---
@@ -442,16 +493,38 @@ Store the output as `ARCHITECTURE_REPORT`.
 ### Step 1B: Validate Architecture Report
 
 Before proceeding, scan the `ARCHITECTURE_REPORT` for any `VERIFIED: NO` entries.
-For each unverified file that appears in a potential ticket's file list:
+
+**NOTE:** Phase 2 (ticket generation) has NOT run yet at this point. Step 1B validates
+the ARCHITECTURE_REPORT itself — not ticket file lists (those are validated in Phase 2.5).
+
+For each unverified file that appears in the report's INTEGRATION POINTS or EXISTING CODE sections:
 - Spawn a quick Explore agent to read that specific file
-- Update the report with verified data
-- If the file doesn't exist, remove it from the report
+- Update the report with verified data (function signatures, line counts, exports)
+- If the file doesn't exist, remove it from the report and note the correction
+
+Also check the RISKS section: if risks were identified but lack file path evidence,
+spawn a quick read to confirm or dismiss each risk with actual file contents.
 
 ---
 
 ## PHASE 2: PLAN GENERATION
 
 Using the `ARCHITECTURE_REPORT`, generate the implementation plan.
+
+### Pre-Generation: Consume ARCHITECTURE_REPORT Risks
+
+Before generating tickets, review the RISKS section of ARCHITECTURE_REPORT:
+```
+For each risk in ARCHITECTURE_REPORT.RISKS:
+  - If risk type is "conflict with existing code":
+    → Add to affected ticket's Agent Notes: "⚠️ RISK: {risk description}. Check {file}:{lines} before modifying."
+  - If risk type is "performance concern":
+    → Add acceptance criterion: "Performance: {specific metric} must not regress"
+  - If risk type is "missing pattern/convention":
+    → Add to Agent Notes: "No existing pattern for this. Create new convention and document in progress.txt."
+  - If risk has no clear ticket assignment:
+    → Create a dedicated risk-mitigation ticket (complexity S, Wave 1)
+```
 
 ### Sizing Rules (CRITICAL)
 
@@ -536,7 +609,9 @@ BRANCH_BASE: {BRANCH_BASE}
 LINEAR_FILTER:
   team: "{LINEAR_TEAM}"
   label: "{LINEAR_SPRINT_LABEL}"
-  status: ["Todo"]
+  status: ["Todo"]                       # Valid values: "Todo", "In Progress", "In Review", "Done", "Canceled"
+                                          # For fresh sprint: ["Todo"]
+                                          # For resuming: ["Todo", "In Progress"]
 PROJECT_STANDARDS: "{PROJECT_STANDARDS}"
 BUILD_CMD: "{BUILD_CMD}"
 LINT_CMD: "{LINT_CMD}"
@@ -548,6 +623,7 @@ MAX_LOOP_ITERATIONS: {MAX_LOOP_ITERATIONS}
 HUMAN_IN_LOOP: {HUMAN_IN_LOOP}
 PARTIAL_MERGE: {PARTIAL_MERGE}
 SPRINT_DASHBOARD: {SPRINT_DASHBOARD}
+MAX_PARALLEL_CONTEXT_AGENTS: {MAX_PARALLEL_CONTEXT_AGENTS}
 ```
 
 ---
@@ -567,12 +643,18 @@ make assumptions — and assumptions cause incomplete implementations.
 ### Step 2.5A: Spawn Context Agents (Parallel)
 
 For each ticket in the plan, spawn a **Context Agent** (Sonnet) that reads
-the ticket's listed files in depth. Run up to `max_parallel` agents concurrently.
+the ticket's listed files in depth. Run up to `MAX_PARALLEL_CONTEXT_AGENTS` (default: 4) agents concurrently.
+Group tickets that share >50% of their files into a single Context Agent to avoid redundant reads.
 
 ```yaml
 subagent_type: "Explore"
 model: "sonnet"
-# Spawn one per ticket, or group tickets that share files
+# Grouping strategy: Compare file lists across tickets.
+# If ticket A and ticket B share >50% of their "files to modify",
+# merge them into a single Context Agent run (saves API calls + avoids redundant reads).
+# The agent prompt includes BOTH tickets' context needs.
+# Otherwise, spawn one Context Agent per ticket.
+# Max concurrent: MAX_PARALLEL_CONTEXT_AGENTS (default: 4)
 ```
 
 **Context Agent Prompt:**
@@ -591,6 +673,26 @@ mock patterns, error handling conventions). If progress.txt does NOT exist, skip
 
 You are analyzing files for a specific ticket. Read each file COMPLETELY
 and extract detailed implementation context.
+
+## Problem Statement Context (from /define)
+{IF PROBLEM_STATEMENT is not null:
+  ### Constraints
+  {extract_section("Constraints")}
+  → These are HARD LIMITS. Flag any file patterns that would violate these constraints.
+
+  ### Testing Strategy
+  Testing Level: {extract_section("Testing Strategy") — first line or "Standard" default}
+  → This determines how many edge cases and test patterns you should extract.
+    Full = exhaustive edge cases. Standard = happy + error paths. Minimal = core logic only.
+
+  ### User Journey (relevant steps for this ticket)
+  {Extract ONLY the user journey steps relevant to this ticket's purpose — not the full journey.
+   If the ticket implements step 3 of the journey, include step 3 and its immediate neighbors.}
+  → Use this to understand the UX context for the code you're analyzing.
+}
+{IF PROBLEM_STATEMENT is null:
+  No problem statement available. Analyze based on ticket description only.
+}
 
 ## Ticket Being Analyzed
 Title: "{TICKET_TITLE}"
@@ -660,6 +762,47 @@ Mark any unread files as UNVERIFIED.
 ```
 
 Store each output as `TICKET_CONTEXT_REPORT[ticket_number]`.
+
+**TICKET_CONTEXT_REPORT Structure:**
+```yaml
+TICKET_CONTEXT_REPORT:
+  ticket_number: {N}
+  ticket_title: "{title}"
+  files_analyzed:
+    - path: "{exact/file/path.ts}"
+      status: "MODIFY" | "CREATE_NEIGHBOR"  # CREATE_NEIGHBOR = read similar file for patterns
+      verified: true | false
+      line_count: {N}
+      functions:
+        - name: "{functionName}"
+          signature: "{full TypeScript signature}"
+          behavior: "{1-sentence description}"
+          side_effects: ["{DB write}", "{event emission}", ...]
+          error_handling: "throws AppError" | "returns null" | "Result<T,E>"
+      types:
+        - name: "{TypeName}"
+          file_line: "{path}:{line}"
+          fields: ["{fieldName}: {type} (required|optional) — {purpose}"]
+          nullable_fields: ["{fieldName}"]
+      callers:
+        - file: "{caller/file/path.ts}"
+          function: "{callerFunction}"
+          usage: "{how it calls this module — args passed, return value used}"
+  error_patterns:
+    style: "throw" | "Result" | "error code" | "mixed"
+    examples: ["{1-2 code snippets from actual files}"]
+  test_patterns:
+    runner: "vitest" | "jest" | "other"
+    test_file: "{path/to/test.ts}"
+    mock_style: "vi.mock()" | "jest.mock()" | "manual"
+    fixtures: ["{factoryFunction} from {file}"]
+    example_structure: "{representative test case snippet}"
+  suggested_edge_cases:
+    - function: "{functionName}"
+      input: "{condition — e.g., empty string for userId}"
+      expected: "{specific behavior — e.g., throws ValidationError}"
+  unverified_files: ["{paths found but not read}"]
+```
 
 ### Step 2.5B: Flag Plan Mismatches
 
@@ -748,7 +891,12 @@ You are validating that ticket dependencies are correct.
    - If yes → that ticket MUST be listed as a dependency
 
 2. For each file being CREATED:
-   - What will it export?
+   - What will it export? (Infer from the ticket's acceptance criteria, agent notes,
+     and the "Files to create" description — e.g., "notification.service.ts — exports
+     handleNotification, getUnreadCount" tells you the planned exports.)
+   - If the ticket description doesn't specify exports, FLAG it:
+     "⚠️ Ticket {N} creates {file} but doesn't declare its exports.
+      Cannot verify downstream dependencies. Add export list to ticket description."
    - Which other ticket's files will import from it?
    - Those tickets MUST depend on this ticket
 
@@ -836,11 +984,71 @@ Present the full plan to the user. Display:
 9. **Problem statement coverage** (if PROBLEM_STATEMENT loaded) — validate using keyword matching:
 
    **Algorithm: Keyword Extraction + Ticket Scanning**
+
+   **Helper: `extract_nouns_and_key_phrases(text)`**
+   ```
+   extract_nouns_and_key_phrases(text):
+       # PURPOSE: Extract 2-4 meaningful keywords/phrases from a success criterion
+       # for matching against ticket titles and descriptions.
+       #
+       # ALGORITHM:
+       # 1. Lowercase the text
+       # 2. Remove common stop words: a, an, the, is, are, was, were, be, been,
+       #    has, have, had, do, does, did, will, shall, should, can, could, may,
+       #    must, with, from, for, and, or, but, in, on, at, to, of, by, as, it,
+       #    its, that, this, when, if, then, than, also, each, every, all, any
+       # 3. Remove common verbs: renders, displays, shows, handles, creates,
+       #    returns, sends, receives, validates, checks, updates, saves, loads
+       # 4. Extract remaining multi-word phrases (2-3 word sequences) as primary keywords
+       #    Example: "notification bell" > "notification" alone
+       # 5. Extract remaining single words (4+ characters) as fallback keywords
+       # 6. Return unique list of 2-4 keywords, preferring multi-word phrases
+       #
+       # EXAMPLES:
+       #   "Notification bell renders in top nav with unread count"
+       #   → ["notification bell", "top nav", "unread count"]
+       #
+       #   "User can mark individual notifications as read"
+       #   → ["mark notifications", "individual notifications", "read"]
+       #
+       #   "API returns paginated notification history"
+       #   → ["paginated notification", "notification history"]
+       #
+       # FALLBACK: If fewer than 2 keywords extracted, split text on spaces
+       # and return the 2-3 longest words (excluding stop words).
+
+       keywords = []
+       cleaned = lowercase(text)
+       cleaned = remove_stop_words(cleaned)
+       cleaned = remove_common_verbs(cleaned)
+
+       # Extract bigrams (2-word phrases) first — more specific matches
+       words = split(cleaned)
+       for i in range(len(words) - 1):
+           bigram = words[i] + " " + words[i+1]
+           if len(words[i]) >= 3 and len(words[i+1]) >= 3:
+               keywords.append(bigram)
+
+       # Add remaining significant single words not already in a bigram
+       for word in words:
+           if len(word) >= 4 and not any(word in k for k in keywords):
+               keywords.append(word)
+
+       # Deduplicate and limit to 2-4 keywords
+       keywords = unique(keywords)[:4]
+
+       # Fallback: if fewer than 2, use longest words from original text
+       if len(keywords) < 2:
+           keywords = sorted(words, key=len, reverse=True)[:3]
+
+       return keywords
+   ```
+
    ```
    For each success_criterion in SUCCESS_CRITERIA:
-       # Step 1: Extract 2-3 unique keywords from the criterion
+       # Step 1: Extract 2-4 unique keywords from the criterion
        #   "Notification bell renders in top nav with unread count"
-       #   → keywords: ["notification bell", "unread count"]
+       #   → keywords: ["notification bell", "top nav", "unread count"]
        keywords = extract_nouns_and_key_phrases(criterion)
 
        # Step 2: Search all ticket titles + descriptions for keyword matches
@@ -898,7 +1106,22 @@ Options:
 If the user says "modify":
 - Parse their requested changes
 - Update the affected tickets in the plan
-- Re-display the modified tickets only
+- **Re-enrichment check:** For each modified ticket, determine if re-enrichment is needed:
+  ```
+  NEEDS_RE_ENRICHMENT if ANY of:
+    - Files to create/modify changed → re-run Phase 2.5 Context Agent for this ticket
+    - Dependencies changed → re-run Phase 2.75B Dependency Validator
+    - Ticket was split or merged → re-run Phase 2.5 + 2.75A (edge cases) + 2.75C (sizing)
+    - Acceptance criteria changed substantially → re-run Phase 2.75A (edge cases)
+
+  SKIP_RE_ENRICHMENT if ONLY:
+    - Title or description wording changed (cosmetic)
+    - Priority changed
+    - Wave/phase assignment changed without file changes
+    - Agent notes updated
+  ```
+- If re-enrichment needed: run the minimal set of phases, then re-display
+- If no re-enrichment needed: re-display the modified tickets only
 - Ask for approval again
 
 ### Dry Run Mode
@@ -928,8 +1151,9 @@ Store the returned `PROJECT_ID`.
 
 ### Step 4B: Create Tickets (in dependency order)
 
-Create tickets starting from Phase 1 (no dependencies) through Phase 4.
+Create tickets starting from Wave 1 (no dependencies) through Wave 4.
 This ensures "depends on" relationships can reference already-created ticket IDs.
+(Note: "Wave" here refers to Implementation Waves from the plan, NOT /sprint phases.)
 
 For each ticket:
 
@@ -999,9 +1223,14 @@ interface {TypeName} {
 </details>
 
 ## Caller-Callee Contracts (Ghost Dependency Prevention)
-{Functions your new code will CALL — exact signatures and behaviors}
+{A "ghost dependency" is an existing file that imports from a file this ticket modifies,
+but is NOT listed in this ticket's "Files to modify." If the modified function's signature
+or behavior changes, the ghost dependency will break silently. List ALL functions this
+ticket's code will call or be called by, with exact signatures.}
 - `{module}.{function}({params})` → returns {type}, throws on {condition}
 - `{module}.{function}({params})` → returns {type}, side effects: {DB write, event emit, etc.}
+- Ghost callers (files that import from modified files but aren't in this ticket):
+  - `{caller/path.ts}` imports `{functionName}` — will break if signature changes
 
 ## Test Patterns (Follow These Conventions)
 - **Test runner:** {vitest|jest|other}
@@ -1158,6 +1387,12 @@ IF all of these are true → recommend Subagents (lower cost):
   - All tickets are complexity S
   - Total tickets <= 3
   - Total edge cases < 15
+
+OTHERWISE (mixed conditions — doesn't clearly fit either mode):
+  → Default to Agent Teams (safer choice for mixed complexity)
+  → Explain which conditions matched each mode:
+    "Some tickets have dependencies (→ Agent Teams) but total edge cases are low (→ Subagents).
+     Defaulting to Agent Teams for safety. Override in /sprint config if desired."
 
 Display recommendation in the Sprint Config output:
   ## Coordination Mode Recommendation
@@ -1342,6 +1577,10 @@ Or tell me: "delete the tickets you just created"
     as they are created, so a mid-creation failure can be rolled back.
 19. **Recommend coordination mode.** Phase 5B.5 analyzes ticket complexity and
     dependencies to recommend Agent Teams vs Subagents for /sprint.
+20. **Respect concurrency limits.** Phase 2.5 spawns at most `MAX_PARALLEL_CONTEXT_AGENTS`
+    (default: 4) concurrent agents. Group tickets sharing >50% of files into one agent.
+21. **Re-enrich after modifications.** If user modifies tickets in Phase 3, re-run
+    affected enrichment phases (2.5/2.75) before re-presenting. Cosmetic changes skip re-enrichment.
 
 ---
 
@@ -1353,6 +1592,10 @@ Or tell me: "delete the tickets you just created"
     ▼
 ┌─────────────────────────────────────────┐
 │  PHASE 0: PRE-FLIGHT                    │
+│  ├── Load problem statement (if exists) │
+│  │   ├── Schema + section validation    │
+│  │   ├── Staleness check (commit SHA)   │
+│  │   └── Extract key fields             │
 │  ├── Check Linear MCP connection        │
 │  ├── Verify git clean + pull base       │
 │  ├── Verify baseline BUILD passes       │
@@ -1376,6 +1619,7 @@ Or tell me: "delete the tickets you just created"
     ▼
 ┌─────────────────────────────────────────┐
 │  PHASE 2: PLAN GENERATION               │
+│  ├── Consume ARCHITECTURE_REPORT risks  │
 │  ├── Size tickets (per-ticket limits)   │
 │  ├── Map dependencies                   │
 │  ├── Tag tickets (migration/schema/etc) │
@@ -1418,10 +1662,13 @@ Or tell me: "delete the tickets you just created"
 ┌─────────────────────────────────────────┐
 │  PHASE 3: APPROVAL GATE                 │
 │  ├── Summary + ticket tree              │
+│  ├── Problem statement coverage check   │
 │  ├── Edge case coverage count           │
 │  ├── Dependency validation status       │
 │  ├── Complexity changes summary         │
-│  └── Options: create / modify / dry-run │
+│  ├── Options: create / modify / dry-run │
+│  └── If modify → re-enrichment loop     │
+│       back to Phase 2.5/2.75 if needed  │
 └─────────────────────────────────────────┘
     │
     ▼
@@ -1454,10 +1701,14 @@ Or tell me: "delete the tickets you just created"
 |-------|-------|-------|---------|-----------------|
 | Broad Explore | 1 | Sonnet | Architecture sweep, patterns, types, test infra | YES |
 | Validation Read | 1B | Sonnet | Verify [UNVERIFIED] file references | YES |
-| Context Agent (×N) | 2.5 | Sonnet | Deep file reads per ticket — signatures, callers, tests | YES |
+| Context Agent (×N) | 2.5 | Sonnet | Deep file reads per ticket — signatures, callers, tests. Output: TICKET_CONTEXT_REPORT (see formal structure in Phase 2.5). Receives problem statement context. | YES |
 | Dependency Validator | 2.75B | Sonnet | Import graph analysis, circular dep detection | YES |
 
 **All agents receive ANTI-HALLUCINATION RULES in their prompt. No exceptions.**
+
+**Helper functions used by the orchestrator (not agents):**
+- `extract_section(heading, [file])` — Parses markdown sections from problem-statement.md (Phase 0-Pre)
+- `extract_nouns_and_key_phrases(text)` — Extracts keywords for coverage matching (Phase 3)
 
 ---
 
@@ -1475,13 +1726,15 @@ Before presenting to user at Phase 3, verify:
 [ ] Phase 0: Linear MCP connected, git clean, baseline build passes
 [ ] Phase 0: progress.txt initialized (or already exists)
 [ ] Phase 0: .claude/agent-memory/tickets-explore/ directory created
-[ ] Phase 0: .gitignore includes worktrees, sprint-dashboard, sprint-state, sprint-hints
+[ ] Phase 0: .gitignore includes worktrees, sprint-dashboard, sprint-state, problem-statement, sprint-hints
 [ ] Phase 1: ARCHITECTURE_REPORT has 0 UNVERIFIED references
 [ ] Phase 1: Test infrastructure documented (runner, mocking, fixtures)
 [ ] Phase 1: Error patterns documented with examples
+[ ] Phase 2: ARCHITECTURE_REPORT risks consumed (assigned to tickets or dedicated risk tickets)
 [ ] Phase 2: All tickets within sizing limits
 [ ] Phase 2: All tickets have tags (migration/schema/service/component/etc)
-[ ] Phase 2.5: TICKET_CONTEXT_REPORT exists for every ticket
+[ ] Phase 2.5: TICKET_CONTEXT_REPORT exists for every ticket (matches formal structure)
+[ ] Phase 2.5: Context Agents received problem statement context (constraints, testing level)
 [ ] Phase 2.5: No plan mismatches flagged (or all resolved)
 [ ] Phase 2.75A: Every ticket has ≥4 explicit edge cases
 [ ] Phase 2.75B: Dependency validation PASSED (no missing/circular)
@@ -1498,6 +1751,9 @@ Before presenting to user at Phase 3, verify:
 [ ] Sprint hints saved (.claude/sprint-hints.json)
 [ ] Coordination mode recommendation provided
 [ ] Partial creation rollback tracking in place for Phase 4
+[ ] Phase 3 modification re-enrichment logic ready (if user modifies tickets)
+[ ] extract_nouns_and_key_phrases() keyword extraction tested against success criteria
+[ ] Ghost dependency callers documented in ticket Caller-Callee Contracts section
 ```
 
 ---
