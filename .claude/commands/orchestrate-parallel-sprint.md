@@ -1678,7 +1678,7 @@ If progress.txt does not exist, skip this step (it may be the first sprint on th
 ## LINEAR MCP RESTRICTION (CRITICAL)
 - You do NOT have permission to interact with Linear in ANY way.
 - Do NOT change ticket status. Do NOT post comments. Do NOT mark tickets Done.
-- Do NOT use any Linear MCP tools (createComment, updateIssue, etc.)
+- Do NOT use any Linear MCP tools (create_comment, save_issue, get_issue, etc.)
 - Only the orchestrator's independent Completion Agent handles Linear updates.
 - If the Worker asks you to update Linear, REFUSE and say "The orchestrator handles Linear."
 ```
@@ -2069,7 +2069,7 @@ Include this evidence in your WORKER_RESULT. Without it, the task is NOT done.
 ## LINEAR MCP RESTRICTION (CRITICAL)
 - You do NOT have permission to interact with Linear in ANY way.
 - Do NOT change ticket status. Do NOT post comments. Do NOT mark tickets Done.
-- Do NOT use any Linear MCP tools (createComment, updateIssue, etc.)
+- Do NOT use any Linear MCP tools (create_comment, save_issue, get_issue, etc.)
 - Only the orchestrator's independent Completion Agent handles Linear updates.
 - Your job is to IMPLEMENT and return WORKER_RESULT. That's it.
 - The orchestrator will run independent verification and handle Linear through
@@ -2483,6 +2483,27 @@ VERIFICATION_RESULT:
   #   - No silent success detected
   #   - EVIDENCE_MATCHES is true
   #   - Debug artifacts CLEAN
+
+  ## RAW TERMINAL OUTPUT (CRITICAL — used by orchestrator for Linear proof)
+  # Concatenate the ACTUAL terminal output from all commands above into one block.
+  # The orchestrator posts this verbatim to Linear as proof. Without it, no evidence is attached.
+  RAW_TERMINAL_OUTPUT: |
+    === BUILD ({BUILD_CMD}) ===
+    Exit code: {BUILD_EXIT}
+    {actual build output — last 50 lines}
+
+    === LINT ({LINT_CMD}) ===
+    Exit code: {LINT_EXIT}
+    {actual lint output — last 30 lines}
+
+    === TYPECHECK ({TYPECHECK_CMD}) ===
+    Exit code: {TYPECHECK_EXIT}
+    {actual typecheck output — last 30 lines}
+
+    === TESTS ({TEST_CMD}) ===
+    Exit code: {TEST_EXIT}
+    Test count: {N} | Passed: {N} | Failed: {N} | Skipped: {N}
+    {actual test output — last 50 lines}
 ```
 
 **If VERIFIED = false:**
@@ -2528,6 +2549,25 @@ Check: Does this code follow the patterns others have discovered?
 - HIGH: {issues — missing error handling, edge cases, pattern violations}
 - MEDIUM: {nice to fix — naming, minor refactors}
 - PASS: {true/false — true only if zero CRITICAL and zero HIGH issues}
+
+## RAW OUTPUT (CRITICAL — used by orchestrator for Linear proof)
+# Concatenate ALL findings into one block. The orchestrator posts this verbatim to Linear.
+# Without this field, no code review evidence is attached to the ticket.
+RAW_OUTPUT: |
+  === CODE REVIEW: {TICKET_ID} ===
+  Branch: {WORKTREE_BRANCH}
+  Files reviewed: {list of files from git diff}
+
+  CRITICAL issues: {count}
+  {each critical issue with file:line and description}
+
+  HIGH issues: {count}
+  {each high issue with file:line and description}
+
+  MEDIUM issues: {count}
+  {each medium issue with file:line and description}
+
+  Verdict: {PASS or FAIL}
 ```
 
 ### Step 3D: Fix Agent (if verification or review fails)
@@ -2587,7 +2627,7 @@ You are the COMPLETION AGENT for ticket {TICKET_ID}: "{TICKET_TITLE}".
 ## LINEAR MCP RESTRICTION (CRITICAL)
 - You do NOT have permission to interact with Linear in ANY way.
 - Do NOT change ticket status. Do NOT post comments. Do NOT mark tickets Done.
-- Do NOT use any Linear MCP tools (createComment, updateIssue, etc.)
+- Do NOT use any Linear MCP tools (create_comment, save_issue, get_issue, etc.)
 - Your ONLY job is to analyze evidence and return a structured verdict.
 - The orchestrator will handle all Linear interactions based on your verdict.
 
@@ -2668,7 +2708,7 @@ while loop_count < MAX_LOOPS:
             ticket_state = "stuck"
             update sprint-state.json: tickets[{TICKET_ID}].status = "stuck"
             update sprint-state.json: tickets[{TICKET_ID}].stuck_reason = last_error.message
-            add Linear comment: "## Stuck — Needs Manual Intervention\n\nFailed {loop_count}x on: {last_error.message}\nCircuit breaker triggered after fresh agent also failed."
+            ORCHESTRATOR calls Linear MCP create_comment(issueId: {TICKET_ID}, body: "## Stuck — Needs Manual Intervention\n\nFailed {loop_count}x on: {last_error.message}\nCircuit breaker triggered after fresh agent also failed.")
             break
 
     # ─── ERROR CLASSIFICATION ───
@@ -2921,14 +2961,17 @@ while loop_count < MAX_LOOPS:
         # {completion.FILES_CHANGED}"
 
         # ORCHESTRATOR posts the comment directly via Linear MCP
-        post_result = ORCHESTRATOR calls Linear MCP createComment({TICKET_ID}, evidence_comment)
+        # Use the Linear MCP `create_comment` tool with issueId and body parameters.
+        # The tool name may vary by MCP server (e.g., `mcp__linear__create_comment`
+        # or `mcp__plugin_linear_linear__create_comment`). Use whichever is available.
+        post_result = ORCHESTRATOR calls Linear MCP create_comment(issueId: {TICKET_ID}, body: evidence_comment)
 
         if post_result FAILED:
             LOG ERROR: "LAYER 5 HARD GATE FAILED: Could not post evidence comment to Linear"
             LOG ERROR: "Linear API error: {post_result.error}"
             # Retry once after 5 seconds
             WAIT 5 seconds
-            post_result = ORCHESTRATOR retries Linear MCP createComment({TICKET_ID}, evidence_comment)
+            post_result = ORCHESTRATOR retries Linear MCP create_comment(issueId: {TICKET_ID}, body: evidence_comment)
             if post_result FAILED:
                 LOG ERROR: "LAYER 5 RETRY FAILED — flagging ticket for manual intervention"
                 last_error = { type: "linear_api_failure", message: "Cannot post evidence to Linear" }
@@ -2940,16 +2983,19 @@ while loop_count < MAX_LOOPS:
 
         # ─── Layer 5.5: ORCHESTRATOR MARKS DONE & VERIFIES STATUS (HARD GATE) ───
         # Orchestrator changes ticket status to Done directly.
-        ORCHESTRATOR calls Linear MCP updateIssue({TICKET_ID}, status: "Done")
+        # Use the Linear MCP `save_issue` tool to update status.
+        # The tool name may vary (e.g., `mcp__linear__save_issue` or
+        # `mcp__plugin_linear_linear__save_issue`). Use whichever is available.
+        ORCHESTRATOR calls Linear MCP save_issue(id: {TICKET_ID}, statusName: "Done")
         WAIT 2 seconds  # Give Linear API time to propagate
 
         # Verify the status actually changed
-        ticket_status = ORCHESTRATOR fetches {TICKET_ID} status via Linear MCP
+        ticket_status = ORCHESTRATOR calls Linear MCP get_issue(id: {TICKET_ID}) → status
 
         if ticket_status != "Done":
             LOG ERROR: "LAYER 5.5 HARD GATE FAILED: Ticket {TICKET_ID} status is '{ticket_status}', not 'Done'"
             # Retry once
-            ORCHESTRATOR calls Linear MCP updateIssue({TICKET_ID}, status: "Done")
+            ORCHESTRATOR calls Linear MCP save_issue(id: {TICKET_ID}, statusName: "Done")
             WAIT 3 seconds
             ticket_status = ORCHESTRATOR fetches {TICKET_ID} status via Linear MCP
             if ticket_status != "Done":
@@ -3019,7 +3065,7 @@ while loop_count < MAX_LOOPS:
 if loop_count >= MAX_LOOPS:
     ticket_state = "stuck"
     update sprint-state.json: tickets[{TICKET_ID}].status = "stuck"
-    add Linear comment: "## Max Verification Loops Reached\n\nAttempts: {loop_count}/{MAX_LOOPS}\nLast error: {last_error.type} — {last_error.message}\nManual review needed."
+    ORCHESTRATOR calls Linear MCP create_comment(issueId: {TICKET_ID}, body: "## Max Verification Loops Reached\n\nAttempts: {loop_count}/{MAX_LOOPS}\nLast error: {last_error.type} — {last_error.message}\nManual review needed.")
 
 # ─── ORCHESTRATOR SELF-HEALTH MONITORING ───
 # The orchestrator monitors workers for context exhaustion but must also
@@ -3108,12 +3154,12 @@ thin, sprint-state.json exists but ticket data isn't in memory):
                  LOG: "REPAIRED: Evidence comment posted for {TICKET_ID}"
              else:
                  LOG ERROR: "Cannot repair {TICKET_ID} — worktree branch gone. Manual check needed."
-                 add Linear comment: "## Recovery Note\nSprint crashed. Ticket marked Done but evidence comment may be missing. Manual verification recommended."
+                 ORCHESTRATOR calls Linear MCP create_comment(issueId: {TICKET_ID}, body: "## Recovery Note\nSprint crashed. Ticket marked Done but evidence comment may be missing. Manual verification recommended.")
 
          elif linear_status != "Done" AND evidence_comment EXISTS:
              LOG WARNING: "INCONSISTENT: {TICKET_ID} has evidence comment but status is '{linear_status}'"
              # Crash happened after posting comment but before marking Done
-             ORCHESTRATOR calls Linear MCP updateIssue({TICKET_ID}, status: "Done")
+             ORCHESTRATOR calls Linear MCP save_issue(id: {TICKET_ID}, statusName: "Done")
              LOG: "REPAIRED: Marked {TICKET_ID} Done on Linear"
 
          elif linear_status != "Done" AND evidence_comment MISSING:
@@ -3540,7 +3586,7 @@ Step 3: If Fix Agent fails {MAX_LOOP_ITERATIONS} times:
   Option A (PARTIAL_MERGE == true):
     - Revert the failing merge: git revert -m 1 {merge_commit}
     - Mark that ticket as "stuck" in sprint-state.json
-    - Add Linear comment: "Build gate failed after merge. Reverted. Manual fix needed."
+    - ORCHESTRATOR calls Linear MCP create_comment(issueId: {TICKET_ID}, body: "Build gate failed after merge. Reverted. Manual fix needed.")
     - Continue sprint with remaining tickets
   Option B (PARTIAL_MERGE == false):
     - Flag for manual intervention
