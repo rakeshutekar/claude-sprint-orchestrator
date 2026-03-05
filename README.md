@@ -251,7 +251,7 @@ The execution command. Fetches tickets from Linear, deploys Agent Teams per tick
 7. **Pre-merge integration check** — Merges ALL tickets into a temp branch and runs full test suite BEFORE real merges. Catches cross-ticket failures early. Routes failures back to the original Worker Agent (not a cold Build Gate Agent). Detects test fixture collisions across tickets.
 8. **Merge scheduling** — Conflict prediction via file overlap analysis, intent context for resolution, dependency drift detection (fresh npm install after package.json changes), post-merge verification
 9. **Build gate** — Full quality gate with bisection protocol for failure isolation
-10. **E2E behavioral verification** — Uses Vercel's `agent-browser` CLI (82-93% less context than Playwright MCP). Orchestrator starts one shared dev server. Each E2E agent runs in isolated `--session {TICKET_ID}`. Snapshot → interact via @refs → verify behaviors → collect evidence.
+10. **E2E behavioral verification** — Uses Vercel's `agent-browser` CLI for browser interactions. Orchestrator starts one shared dev server. Each E2E agent runs in isolated `--session {TICKET_ID}`. Snapshot → interact via @refs → verify behaviors → collect evidence.
 11. **Auto-retrospective** — Analyzes sprint performance, updates failure pattern database, feeds learnings back to progress.txt and /tickets memory
 
 ### `/sprint` Flow
@@ -444,7 +444,7 @@ The execution command. Fetches tickets from Linear, deploys Agent Teams per tick
 - **Code Simplifier safeguards** — Conditional execution (skipped in Agent Teams + clean code, bug fixes, small tickets). Auto-reverts if it breaks tests.
 - **Context exhaustion detection** — Detects truncated or degraded Worker output and spawns a fresh agent with partial work. In Agent Teams mode, the Context Agent self-monitors for degradation and warns the Worker. The Worker verifies Context Agent answers by reading files directly when warnings appear.
 - **Crash recovery with rollback safety** — After compaction or crash, reconciles sprint-state.json against actual Linear state. Detects and repairs four inconsistency types: phantom completes, orphaned evidence comments, missing status changes, and stale in-progress states.
-- **E2E via agent-browser** — Uses Vercel's agent-browser CLI instead of Playwright MCP. 82-93% less context per test. Snapshot → interact via `@ref` → verify behaviors. `--session {TICKET_ID}` for parallel isolation.
+- **E2E via agent-browser** — Uses Vercel's agent-browser CLI for browser-based verification. Lightweight @ref snapshots keep context usage minimal. `--session {TICKET_ID}` for parallel isolation.
 - **Sprint dashboard** — Live `.claude/sprint-dashboard.md` for observability
 - **Post-sprint learning loop** — Auto-retrospective feeds learnings back to progress.txt, CLAUDE.md, /tickets memory, and failure pattern database
 - **Human-in-loop mode** — Optional pause for human review before marking tickets Done
@@ -568,7 +568,7 @@ BUILD_CMD: "npm run build"
 LINT_CMD: "npm run lint"
 TEST_CMD: "npm run test:run"
 TYPECHECK_CMD: "npx tsc --noEmit"
-E2E_CMD: "npx playwright test"
+E2E_CMD: "agent-browser"
 MAX_LOOP_ITERATIONS: 3
 HUMAN_IN_LOOP: false
 PARTIAL_MERGE: true
